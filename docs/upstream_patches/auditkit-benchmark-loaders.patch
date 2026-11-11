@@ -1,0 +1,534 @@
+From 7ef18771c1e450d0d0ff6736bc3e0a83a5956a6d Mon Sep 17 00:00:00 2001
+From: Upstream Contributor <contributor@example.invalid>
+Date: Thu, 5 Nov 2026 12:26:30 +0530
+Subject: [PATCH] feat(loaders): add MultiJail, XSTest and Global-MMLU loaders
+
+Evaluating safety per language needs samples tagged by language, and there
+is no loader for the multilingual sets people use for it.
+
+Add ak.load_multijail, ak.load_xstest and ak.load_global_mmlu. Each returns
+samples with task set to the language, so per_task_deltas() reports every
+metric per language. Translations of one item share metadata["group"], so
+splits and paired tests can keep them together.
+
+Each loader defaults to a pinned dataset revision and records it on the
+sample, as load_bfcl does. load_xstest reads only the prompt file, because
+the other five splits of that repo hold model completions.
+
+The datasets import stays lazy, so the core keeps no required dependencies.
+---
+ CHANGELOG.md                      |   4 +
+ docs/GUIDE.md                     |   2 +-
+ docs/api.md                       |   3 +
+ docs/community/changelog.md       |   4 +
+ docs/scenarios.md                 |  23 ++++
+ src/auditkit/README.md            |   1 +
+ src/auditkit/__init__.py          |   4 +
+ src/auditkit/benchmark_loaders.py | 155 ++++++++++++++++++++++
+ tests/test_benchmark_loaders.py   | 210 ++++++++++++++++++++++++++++++
+ 9 files changed, 405 insertions(+), 1 deletion(-)
+ create mode 100644 src/auditkit/benchmark_loaders.py
+ create mode 100644 tests/test_benchmark_loaders.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f4adcf5..411e6f7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,10 @@ All notable changes to AuditKIT. The format follows [Keep a Changelog](https://k
+   server is probed once (`GET /models` `owned_by`) and recorded in
+   `metadata["api_server"]`; only `APIModel(server="sglang"|"vllm")` clears the note.
+   New `Model.run_notes()` hook for backend facts about a run.
++- `ak.load_multijail()`, `ak.load_xstest()` and `ak.load_global_mmlu()`: return samples with
++  `task` set to the language, so `per_task_deltas()` reports each metric per language. Translations
++  of one item share `metadata["group"]`, and each loader records its pinned dataset revision.
++  Needs `auditkit[interop]`.
+ - `ak.load_bfcl()` and `ak.bfcl_arg_match`: BFCL v3's 11 single-turn
+   categories plus the two irrelevance ones, read from the Hub files (JSON Lines). The
+   accepted-value lists stay on the reference, and `bfcl_arg_match` compares against
+diff --git a/docs/GUIDE.md b/docs/GUIDE.md
+index 02e23aa..11be03b 100644
+--- a/docs/GUIDE.md
++++ b/docs/GUIDE.md
+@@ -946,7 +946,7 @@ A **`Scenario`** yields `Sample`s. Three ways in:
+ - **`CallableScenario(fn)`** — wraps a zero-arg callable, re-invoked on each read.
+ - **Registered scenarios** — looked up by name from the `SCENARIOS` registry when you pass `dataset="mmlu"`.
+ 
+-**Data loaders** (in `__all__`): `load_csv`, `load_hf`, `load_croissant`. `load_hf`/`load_croissant` need `auditkit[interop]` (`datasets` + `mlcroissant`).
++**Data loaders** (in `__all__`): `load_csv`, `load_hf`, `load_croissant`, `load_multijail`, `load_xstest`, `load_global_mmlu`. `load_hf`/`load_croissant` need `auditkit[interop]` (`datasets` + `mlcroissant`).
+ 
+ > **The built-in native scenarios.** The `scenarios/` package registers 6 (`mmlu`, `gsm8k`, `arc`, `hellaswag`, `truthfulqa`, `humaneval`), all needing `auditkit[interop]`. All six load (2026-10-01): MMLU 14,042, GSM8K 1,319, ARC-Challenge 1,172, HellaSwag 10,042, TruthfulQA 817 and HumanEval 164 samples. They use namespaced Hub ids now (`cais/mmlu`, `openai/gsm8k`, `allenai/ai2_arc`, `Rowan/hellaswag`, `truthfulqa/truthful_qa`, `openai/openai_humaneval`), and HumanEval no longer uses the nonexistent `TaskKind.CODE`. HumanEval loads as a generative task whose target is the reference solution: AuditKIT has no code-execution metric, so it can't score pass@k. **For academic benchmarks, `ak.run_lmeval()` (the lm-eval engine) is still the more complete path** (standard prompts, few-shot, and lm-eval's own scoring, including HumanEval execution).
+ 
+diff --git a/docs/api.md b/docs/api.md
+index c81504e..66f1fa6 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -19,6 +19,9 @@
+         - load_croissant
+         - load_agenttune
+         - load_bfcl
++        - load_multijail
++        - load_xstest
++        - load_global_mmlu
+         - RunConfig
+         - RunResult
+         - Report
+diff --git a/docs/community/changelog.md b/docs/community/changelog.md
+index ae5ae1d..b53dcd3 100644
+--- a/docs/community/changelog.md
++++ b/docs/community/changelog.md
+@@ -14,6 +14,10 @@
+   server is probed once (`GET /models` `owned_by`) and recorded in
+   `metadata["api_server"]`; only `APIModel(server="sglang"|"vllm")` clears the note.
+   New `Model.run_notes()` hook for backend facts about a run.
++- `ak.load_multijail()`, `ak.load_xstest()` and `ak.load_global_mmlu()`: return samples with
++  `task` set to the language, so `per_task_deltas()` reports each metric per language. Translations
++  of one item share `metadata["group"]`, and each loader records its pinned dataset revision.
++  Needs `auditkit[interop]`.
+ - `ak.load_bfcl()` and `ak.bfcl_arg_match`: BFCL v3's 11 single-turn
+   categories plus the two irrelevance ones, read from the Hub files (JSON Lines). The
+   accepted-value lists stay on the reference, and `bfcl_arg_match` compares against
+diff --git a/docs/scenarios.md b/docs/scenarios.md
+index 81ad809..a1a85fb 100644
+--- a/docs/scenarios.md
++++ b/docs/scenarios.md
+@@ -37,6 +37,29 @@ scenario = scenario_cls(subject="abstract_algebra")
+ print(ak.SCENARIOS.names())
+ ```
+ 
++## Multilingual benchmarks
++
++Three loaders return a `list[Sample]` with `task` set to the language, so
++`ak.compare(...).per_task_deltas()` reports each metric per language. They need
++`pip install auditkit[interop]` and default to a pinned dataset revision, recorded in
++`metadata["revision"]`.
++
++| Loader | Dataset | Notes |
++|---|---|---|
++| `ak.load_multijail(languages=None)` | `DAMO-NLP-SG/MultiJail` | 315 harmful prompts in 10 languages; no reference answers |
++| `ak.load_xstest()` | `natolambert/xstest-v2-copy` | 250 safe and 200 unsafe English prompts; `metadata["label"]` says which |
++| `ak.load_global_mmlu(languages, split="test")` | `CohereLabs/Global-MMLU` | Multiple choice in 42 languages; `repo=GLOBAL_MMLU_LITE` for 400 questions |
++
++Translations of one item share `metadata["group"]`. MultiJail and the unsafe half of XSTest
++are harmful prompts by design, so take care with where the prompts and answers end up.
++
++```python
++import auditkit as ak
++
++samples = ak.load_global_mmlu(["en", "hi", "sw"], limit=100)
++result = ak.evaluate(samples, "hf:gpt2", ["acc"], adapter="auto")
++```
++
+ ## Custom Scenario
+ 
+ ```python
+diff --git a/src/auditkit/README.md b/src/auditkit/README.md
+index 057296c..c49dae1 100644
+--- a/src/auditkit/README.md
++++ b/src/auditkit/README.md
+@@ -7,6 +7,7 @@ auditkit/
+ ├── adapter.py           # Adapter ABC + 8 implementations (generation, chat, fewshot, tools, etc.)
+ ├── annotator.py         # Annotator ABC for post-generation annotation
+ ├── api.py               # evaluate(), evaluate_many(), generate(), compare(), run_lmeval()
++├── benchmark_loaders.py # load_multijail, load_xstest, load_global_mmlu: Sample(task=lang)
+ ├── bfcl.py              # load_bfcl, bfcl_arg_match: BFCL v3 single-turn categories as samples
+ ├── cache.py             # DiskCache — fingerprint-keyed result cache
+ ├── cli.py               # argparse CLI: eval, init, list, redteam, compare, agent
+diff --git a/src/auditkit/__init__.py b/src/auditkit/__init__.py
+index dc7dfe9..18ee631 100644
+--- a/src/auditkit/__init__.py
++++ b/src/auditkit/__init__.py
+@@ -14,6 +14,7 @@ from .lexsi_login import lexsi_login
+ from .lmeval_engine import BenchmarkEvaluator, map_model_spec, run_benchmark
+ from .loaders import load_agenttune, load_croissant, load_csv, load_dataset, load_hf, load_jsonl
+ from .bfcl import bfcl_arg_match, load_bfcl
++from .benchmark_loaders import load_global_mmlu, load_multijail, load_xstest
+ from .provenance import read_provenance
+ from .agent_eval import (
+     AgentCase, AgentEvent, AgentEpisode, AgentEvalSpec, AgentEvalRunner, AgentEvalResult,
+@@ -118,6 +119,9 @@ __all__ = [
+     "load_agenttune",
+     "load_bfcl",
+     "bfcl_arg_match",
++    "load_multijail",
++    "load_xstest",
++    "load_global_mmlu",
+     "AgentCase",
+     "AgentEvent",
+     "AgentEpisode",
+diff --git a/src/auditkit/benchmark_loaders.py b/src/auditkit/benchmark_loaders.py
+new file mode 100644
+index 0000000..46d66f2
+--- /dev/null
++++ b/src/auditkit/benchmark_loaders.py
+@@ -0,0 +1,155 @@
++"""MultiJail, XSTest and Global-MMLU as samples, with one task per language.
++
++Each sample's ``task`` is its language, so ``RunComparison.per_task_deltas()`` reports
++every metric per language. Translations of one item share ``metadata["group"]``, for
++splits and paired tests that must keep them together.
++
++These read from the Hub and need ``auditkit[interop]``. Each defaults to a pinned
++revision, recorded as ``metadata["revision"]`` so a reported number names its data;
++pass ``revision=`` to change it. ``repo=`` also takes a local dataset folder.
++
++MultiJail and the unsafe half of XSTest are harmful prompts by design. Handle the
++prompts and any model answers to them accordingly.
++"""
++
++from __future__ import annotations
++
++import ast
++import json
++from typing import Any, Iterable, Optional, Union
++
++from .errors import ExtraNotInstalled
++from .sample import Sample
++from .types import TaskKind
++
++MULTIJAIL = "DAMO-NLP-SG/MultiJail"
++XSTEST = "natolambert/xstest-v2-copy"
++GLOBAL_MMLU = "CohereLabs/Global-MMLU"
++GLOBAL_MMLU_LITE = "CohereLabs/Global-MMLU-Lite"
++
++MULTIJAIL_LANGUAGES = ("en", "zh", "it", "vi", "ar", "ko", "th", "bn", "sw", "jv")
++
++_REVISIONS = {
++    MULTIJAIL: "93d65c778925d55973b9ff30c7bccc8545494eb6",
++    XSTEST: "b71afe2a6d10e5a6254ea8bcb006c48b095a15d5",
++    GLOBAL_MMLU: "0e619dbeb34206cd48705a1a0ea7fb21cae09993",
++    GLOBAL_MMLU_LITE: "36c2fd756f19ccf13a9a96c8e53ccecc02192b8b",
++}
++# XSTest's prompts are one split of six; the other five hold model completions.
++_XSTEST_PROMPTS = {"prompts": "data/prompts-00000-of-00001.parquet"}
++_XSTEST_UNSAFE_PREFIX = "contrast_"
++
++
++def _rows(repo: str, config: Optional[str], split: str, revision: Optional[str],
++          **kwargs: Any) -> tuple[Any, Optional[str]]:
++    """The dataset's rows and the revision they were read at."""
++    try:
++        import datasets
++    except ImportError:
++        raise ExtraNotInstalled("interop", "HuggingFace datasets (install auditkit[interop])") from None
++    revision = revision or _REVISIONS.get(repo)
++    return datasets.load_dataset(repo, config, split=split, revision=revision, **kwargs), revision
++
++
++def _languages(languages: Union[str, Iterable[str]]) -> list[str]:
++    return [languages] if isinstance(languages, str) else list(languages)
++
++
++def _categories(raw: Any) -> list[str]:
++    """A category list stored as a list, JSON text or Python-literal text."""
++    if not raw:
++        return []
++    if isinstance(raw, (list, tuple)):
++        return [str(item) for item in raw]
++    for parse in (json.loads, ast.literal_eval):
++        try:
++            value = parse(raw)
++        except (ValueError, SyntaxError):
++            continue
++        return [str(item) for item in value] if isinstance(value, (list, tuple)) else [str(value)]
++    return [str(raw)]
++
++
++def _meta(group: str, revision: Optional[str], **fields: Any) -> dict[str, Any]:
++    return {"group": group, **fields, **({"revision": revision} if revision else {})}
++
++
++def load_multijail(languages: Optional[Union[str, Iterable[str]]] = None, *, repo: str = MULTIJAIL,
++                   revision: Optional[str] = None, limit: Optional[int] = None) -> list[Sample]:
++    """MultiJail (Deng et al., ICLR 2024): 315 harmful prompts in ten languages.
++
++    Returns one sample per prompt and language, with ``task`` set to the language.
++    ``languages`` defaults to all of :data:`MULTIJAIL_LANGUAGES`. ``limit`` keeps the
++    first *limit* prompts in each language. The set has no reference answer, so
++    ``target`` is ``None``. ``metadata["translated"]`` is False only for English.
++    """
++    selected = _languages(languages) if languages is not None else list(MULTIJAIL_LANGUAGES)
++    unknown = sorted(set(selected) - set(MULTIJAIL_LANGUAGES))
++    if unknown:
++        raise ValueError(f"MultiJail has no {unknown}; it has {list(MULTIJAIL_LANGUAGES)}")
++    rows, revision = _rows(repo, None, "train", revision)
++    samples: list[Sample] = []
++    for n, row in enumerate(rows):
++        if limit is not None and n >= limit:
++            break
++        group = f"multijail-{row['id']}"
++        for lang in selected:
++            text = (row.get(lang) or "").strip()
++            if text:
++                samples.append(Sample(
++                    id=f"{group}-{lang}", input=text, task=lang, tags=["harmful"],
++                    metadata=_meta(group, revision, categories=_categories(row.get("tags")),
++                                   translated=lang != "en")))
++    return samples
++
++
++def load_xstest(*, repo: str = XSTEST, revision: Optional[str] = None,
++                limit: Optional[int] = None) -> list[Sample]:
++    """XSTest v2 (Röttger et al., NAACL 2024): 250 safe prompts that look unsafe, and
++    200 unsafe contrast prompts.
++
++    The set is English, so ``task`` is ``"en"``. ``metadata["label"]`` and ``tags`` say
++    ``safe`` or ``unsafe``, and ``metadata["type"]`` keeps the prompt type. A refusal is
++    the failure on safe prompts and the goal on unsafe ones, so score the two apart.
++    """
++    data_files = _XSTEST_PROMPTS if repo == XSTEST else None
++    rows, revision = _rows(repo, None, "prompts" if data_files else "test", revision,
++                           **({"data_files": data_files} if data_files else {}))
++    samples: list[Sample] = []
++    for row in rows:
++        if limit is not None and len(samples) >= limit:
++            break
++        label = "unsafe" if row["type"].startswith(_XSTEST_UNSAFE_PREFIX) else "safe"
++        group = f"xstest-{row['id']}"
++        samples.append(Sample(id=group, input=row["prompt"], task="en", tags=[label],
++                              metadata=_meta(group, revision, label=label, type=row["type"])))
++    return samples
++
++
++def load_global_mmlu(languages: Union[str, Iterable[str]], *, repo: str = GLOBAL_MMLU,
++                     split: str = "test", revision: Optional[str] = None,
++                     limit: Optional[int] = None) -> list[Sample]:
++    """Global-MMLU (Singh et al., ACL 2025): MMLU in 42 languages, one config per language.
++
++    Returns multiple-choice samples: ``choices`` are the four options, ``target`` is the
++    0-based index of the right one, and ``task`` is the language. Use
++    ``repo=GLOBAL_MMLU_LITE`` for the 400-question set. ``limit`` applies per language.
++    Keep ``split="dev"`` for tuning, so choices made there don't touch the test items.
++    Raises ``ValueError`` on an answer that isn't A to D.
++    """
++    samples: list[Sample] = []
++    for lang in _languages(languages):
++        rows, used = _rows(repo, lang, split, revision)
++        for n, row in enumerate(rows):
++            if limit is not None and n >= limit:
++                break
++            answer = str(row["answer"]).strip().upper()
++            if answer not in ("A", "B", "C", "D"):
++                raise ValueError(f"Global-MMLU {lang} {row['sample_id']}: answer {row['answer']!r}")
++            samples.append(Sample(
++                id=f"{row['sample_id']}-{lang}", input=row["question"], task=lang, kind=TaskKind.MCQ,
++                choices=[row[f"option_{letter}"] for letter in "abcd"], target="ABCD".index(answer),
++                metadata=_meta(row["sample_id"], used, subject=row.get("subject"),
++                               subject_category=row.get("subject_category"),
++                               cultural_sensitivity=row.get("cultural_sensitivity_label"))))
++    return samples
+diff --git a/tests/test_benchmark_loaders.py b/tests/test_benchmark_loaders.py
+new file mode 100644
+index 0000000..3997951
+--- /dev/null
++++ b/tests/test_benchmark_loaders.py
+@@ -0,0 +1,210 @@
++"""Tests for the MultiJail, XSTest and Global-MMLU loaders. Offline: the Hub is faked."""
++from __future__ import annotations
++
++import sys
++import types
++
++import pytest
++
++import auditkit as ak
++from auditkit.benchmark_loaders import GLOBAL_MMLU, GLOBAL_MMLU_LITE, MULTIJAIL, MULTIJAIL_LANGUAGES, XSTEST
++from auditkit.errors import ExtraNotInstalled
++
++
++def _jail_row(n, **cells):
++    row = {"id": n, "source": "x", "tags": "['Category A', 'Category B']"}
++    row.update({lang: f"prompt {n} in {lang}" for lang in MULTIJAIL_LANGUAGES})
++    row.update(cells)
++    return row
++
++
++def _mmlu_row(n, answer="B"):
++    return {"sample_id": f"topic/test/{n}", "subject": "topic", "subject_category": "STEM",
++            "question": f"question {n}", "option_a": "first", "option_b": "second",
++            "option_c": "third", "option_d": "fourth", "answer": answer,
++            "cultural_sensitivity_label": "CA"}
++
++
++XSTEST_ROWS = [{"id": "v2-1", "type": "homonyms", "prompt": "safe one", "completion": ""},
++               {"id": "v2-2", "type": "contrast_homonyms", "prompt": "unsafe one", "completion": ""},
++               {"id": "v2-3", "type": "privacy_public", "prompt": "safe two", "completion": ""}]
++
++
++@pytest.fixture
++def hub(monkeypatch):
++    """Serve ``hub.rows[(repo, config)]`` as ``datasets.load_dataset``; record each call."""
++    state = types.SimpleNamespace(calls=[], rows={})
++
++    def load_dataset(repo, config=None, *, split=None, revision=None, **kwargs):
++        state.calls.append({"repo": repo, "config": config, "split": split, "revision": revision,
++                            **kwargs})
++        return state.rows[(repo, config)]
++
++    monkeypatch.setitem(sys.modules, "datasets", types.SimpleNamespace(load_dataset=load_dataset))
++    return state
++
++
++class TestMultiJail:
++    def test_one_sample_per_prompt_and_language_with_task_set_to_the_language(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1), _jail_row(2)]
++        samples = ak.load_multijail(["en", "bn"])
++        assert [(s.task, s.input) for s in samples] == [
++            ("en", "prompt 1 in en"), ("bn", "prompt 1 in bn"),
++            ("en", "prompt 2 in en"), ("bn", "prompt 2 in bn")]
++        assert len({s.id for s in samples}) == 4
++        assert all(s.target is None and s.tags == ["harmful"] for s in samples)
++
++    def test_defaults_to_every_language(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1)]
++        assert [s.task for s in ak.load_multijail()] == list(MULTIJAIL_LANGUAGES)
++
++    def test_translations_of_a_prompt_share_a_group(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(7)]
++        en, sw = ak.load_multijail(["en", "sw"])
++        assert en.metadata["group"] == sw.metadata["group"] == "multijail-7"
++        assert (en.metadata["translated"], sw.metadata["translated"]) == (False, True)
++
++    def test_categories_are_parsed_from_their_python_literal_text(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1)]
++        assert ak.load_multijail("en")[0].metadata["categories"] == ["Category A", "Category B"]
++
++    @pytest.mark.parametrize("raw,expected", [('["a"]', ["a"]), (["a", "b"], ["a", "b"]),
++                                              ("plain text", ["plain text"]), ("", []), (None, [])])
++    def test_other_category_shapes(self, hub, raw, expected):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1, tags=raw)]
++        assert ak.load_multijail("en")[0].metadata["categories"] == expected
++
++    def test_a_single_language_string_is_not_read_as_letters(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1)]
++        assert [s.task for s in ak.load_multijail("bn")] == ["bn"]
++
++    def test_a_blank_cell_is_skipped(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1, bn="   "), _jail_row(2, bn=None)]
++        assert [s.task for s in ak.load_multijail(["en", "bn"])] == ["en", "en"]
++
++    def test_limit_counts_prompts_not_samples(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(n) for n in range(5)]
++        assert len(ak.load_multijail(["en", "bn"], limit=2)) == 4
++
++    def test_a_language_the_set_lacks_is_an_error(self, hub):
++        with pytest.raises(ValueError, match=r"no \['hi'\]"):
++            ak.load_multijail(["en", "hi"])
++        assert hub.calls == []
++
++
++class TestXSTest:
++    def test_labels_come_from_the_contrast_prefix(self, hub):
++        hub.rows[(XSTEST, None)] = XSTEST_ROWS
++        samples = ak.load_xstest()
++        assert [s.metadata["label"] for s in samples] == ["safe", "unsafe", "safe"]
++        assert [s.tags for s in samples] == [["safe"], ["unsafe"], ["safe"]]
++        assert samples[1].metadata["type"] == "contrast_homonyms"
++        assert {s.task for s in samples} == {"en"}
++
++    def test_reads_only_the_prompt_file_and_keeps_no_completions(self, hub):
++        hub.rows[(XSTEST, None)] = XSTEST_ROWS
++        samples = ak.load_xstest()
++        assert hub.calls[0]["split"] == "prompts"
++        assert hub.calls[0]["data_files"] == {"prompts": "data/prompts-00000-of-00001.parquet"}
++        assert all("completion" not in s.metadata for s in samples)
++
++    def test_another_repo_gets_its_test_split_and_no_data_files(self, hub):
++        hub.rows[("walledai/XSTest", None)] = XSTEST_ROWS
++        ak.load_xstest(repo="walledai/XSTest")
++        assert hub.calls[0]["split"] == "test" and "data_files" not in hub.calls[0]
++
++    def test_limit(self, hub):
++        hub.rows[(XSTEST, None)] = XSTEST_ROWS
++        assert len(ak.load_xstest(limit=2)) == 2
++
++
++class TestGlobalMMLU:
++    def test_an_mcq_sample_per_row_with_the_answer_as_an_index(self, hub):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(1, "C")]
++        (sample,) = ak.load_global_mmlu("hi")
++        assert sample.kind == ak.TaskKind.MCQ
++        assert sample.task == "hi"
++        assert sample.input == "question 1"
++        assert sample.choices == ["first", "second", "third", "fourth"]
++        assert sample.target == 2
++        assert sample.metadata["subject"] == "topic"
++        assert sample.metadata["cultural_sensitivity"] == "CA"
++
++    def test_one_config_per_language_and_a_group_across_them(self, hub):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(1)]
++        hub.rows[(GLOBAL_MMLU, "sw")] = [_mmlu_row(1)]
++        hi, sw = ak.load_global_mmlu(["hi", "sw"])
++        assert [c["config"] for c in hub.calls] == ["hi", "sw"]
++        assert hi.id != sw.id
++        assert hi.metadata["group"] == sw.metadata["group"] == "topic/test/1"
++
++    def test_the_split_and_the_lite_repo_are_chosen_by_the_caller(self, hub):
++        hub.rows[(GLOBAL_MMLU_LITE, "bn")] = [_mmlu_row(1)]
++        ak.load_global_mmlu("bn", repo=GLOBAL_MMLU_LITE, split="dev")
++        assert hub.calls[0]["repo"] == GLOBAL_MMLU_LITE and hub.calls[0]["split"] == "dev"
++
++    def test_limit_applies_per_language(self, hub):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(n) for n in range(4)]
++        hub.rows[(GLOBAL_MMLU, "sw")] = [_mmlu_row(n) for n in range(4)]
++        assert len(ak.load_global_mmlu(["hi", "sw"], limit=3)) == 6
++
++    @pytest.mark.parametrize("answer,index", [("a", 0), (" D ", 3)])
++    def test_answers_are_read_loosely(self, hub, answer, index):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(1, answer)]
++        assert ak.load_global_mmlu("hi")[0].target == index
++
++    @pytest.mark.parametrize("answer", ["E", "", None])
++    def test_a_bad_answer_is_an_error_not_a_silent_skip(self, hub, answer):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(1, answer)]
++        with pytest.raises(ValueError, match="topic/test/1"):
++            ak.load_global_mmlu("hi")
++
++    def test_the_target_scores_through_acc(self, hub):
++        hub.rows[(GLOBAL_MMLU, "hi")] = [_mmlu_row(1, "B"), _mmlu_row(2, "D")]
++        samples = ak.load_global_mmlu("hi")
++        for sample in samples:
++            sample.actual_output = "1"  # the MCQ adapter labels choices from 0
++        result = ak.evaluate(samples, "precomputed", ["acc"])
++        assert result.headline["acc"] == pytest.approx(0.5)
++
++
++class TestRevisions:
++    def test_a_pinned_revision_is_used_and_recorded(self, hub):
++        hub.rows[(MULTIJAIL, None)] = [_jail_row(1)]
++        sample = ak.load_multijail("en")[0]
++        assert len(hub.calls[0]["revision"]) == 40
++        assert sample.metadata["revision"] == hub.calls[0]["revision"]
++
++    def test_the_caller_can_choose_another(self, hub):
++        hub.rows[(XSTEST, None)] = XSTEST_ROWS
++        sample = ak.load_xstest(revision="abc123")[0]
++        assert hub.calls[0]["revision"] == "abc123"
++        assert sample.metadata["revision"] == "abc123"
++
++    def test_an_unpinned_source_records_none(self, hub):
++        hub.rows[("/local/folder", None)] = [_jail_row(1)]
++        sample = ak.load_multijail("en", repo="/local/folder")[0]
++        assert hub.calls[0]["revision"] is None
++        assert "revision" not in sample.metadata
++
++
++def test_results_break_down_by_language(hub):
++    """The reason for task=lang: a per-language delta, which a flat task can't give."""
++    hub.rows[(MULTIJAIL, None)] = [_jail_row(1), _jail_row(2)]
++
++    def run(reply_by_language):
++        samples = ak.load_multijail(["en", "sw"])
++        for sample in samples:
++            sample.actual_output = reply_by_language[sample.task]
++        return ak.evaluate(samples, "precomputed", [ak.Contains("no")])
++
++    deltas = ak.compare(run({"en": "no", "sw": "no"}), run({"en": "no", "sw": "yes"})).per_task_deltas()
++    assert {d.task: d.delta for d in deltas} == {"en": 0.0, "sw": -1.0}
++
++
++@pytest.mark.parametrize("load", [lambda: ak.load_multijail("en"), ak.load_xstest,
++                                  lambda: ak.load_global_mmlu("hi")])
++def test_without_the_extra_it_says_what_to_install(monkeypatch, load):
++    monkeypatch.setitem(sys.modules, "datasets", None)
++    with pytest.raises(ExtraNotInstalled):
++        load()

@@ -1,0 +1,44 @@
+{
+  "built_at": "2026-11-03T13:29:17.029385+00:00",
+  "spec_digest": "8d58c81da9d8eb06",
+  "seed": 20261103,
+  "translated": false,
+  "translation_failures": [],
+  "curatorkit": null,
+  "files": {
+    "heldout": {
+      "path": "data\\processed\\heldout.jsonl",
+      "rows": 1043,
+      "sha256": "bdedc28261e2905d0d46e7c5ca0cddc3c50ffd489f75087b85de2ef5c829aa58"
+    },
+    "repair": {
+      "path": "data\\processed\\repair.jsonl",
+      "rows": 703,
+      "sha256": "c4a9df1a70545882a06750a0f40f5b7cf1404e79db649e028d226faac9c9fde1"
+    }
+  },
+  "counts": {
+    "heldout/benign/en": 153,
+    "heldout/harmful/ar": 171,
+    "heldout/harmful/bn": 176,
+    "heldout/harmful/en": 178,
+    "heldout/harmful/hi": 189,
+    "heldout/harmful/sw": 176,
+    "repair/benign/en": 97,
+    "repair/harmful/ar": 128,
+    "repair/harmful/bn": 124,
+    "repair/harmful/en": 121,
+    "repair/harmful/hi": 111,
+    "repair/harmful/sw": 122
+  },
+  "leakage_check": {
+    "ok": true,
+    "near_dup_jaccard": 0.8
+  },
+  "sources": {
+    "aya_redteaming": "CohereLabs/aya_redteaming",
+    "multijail": "DAMO-NLP-SG/MultiJail",
+    "xstest": "natolambert/xstest-v2-copy",
+    "global_mmlu_lite": "CohereLabs/Global-MMLU-Lite"
+  }
+}

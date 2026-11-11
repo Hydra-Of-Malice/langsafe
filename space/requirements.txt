@@ -1,0 +1,5 @@
+# Prebuilt CPU wheels from llama-cpp-python's own index. PyPI ships only source, which a Space would have to compile.
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+gradio==6.31.0
+# 0.3.19 cannot load Tiny Aya: its chat template uses {% break %}. 0.3.36 is the version tested with these GGUFs.
+llama-cpp-python==0.3.36

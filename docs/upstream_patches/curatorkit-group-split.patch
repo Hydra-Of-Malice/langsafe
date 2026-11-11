@@ -1,0 +1,771 @@
+From 803a0e7c4ed77c7badf131e6e14878f1a49929bc Mon Sep 17 00:00:00 2001
+From: Upstream Contributor <contributor@example.invalid>
+Date: Thu, 5 Nov 2026 12:44:23 +0530
+Subject: [PATCH] feat: add group-aware splits and a leakage check
+
+output_split shuffles sample by sample, so the translations or paraphrases
+of one item can land in both train and test, and a test score then measures
+memorisation.
+
+Add output_split_group (CuratorConfig and YAML), a metadata key whose value
+keeps a group in one split. A group's split is a hash of its id and
+output_split_seed, so an item keeps its split as the corpus grows, which a
+shuffle can't do. Split sizes then only approximate the fractions. Without
+the option, splitting is unchanged and tests pin it to the old shuffle.
+
+Add curatorkit.splits. split_samples is now the one split path: Curator and
+the CLI each had their own copy. leakage_report finds groups, exact prompts
+and near-duplicate prompts in more than one split, and a grouped run warns
+when it finds any. It compares prompts, not prompt plus answer, because one
+prompt with two answers still leaks.
+
+Language ID is not part of this change.
+---
+ CHANGELOG.md                    |   7 +
+ curatorkit/cli.py               |  27 ++--
+ curatorkit/config.py            |   1 +
+ curatorkit/curator.py           |  42 ++---
+ curatorkit/splits.py            | 216 ++++++++++++++++++++++++++
+ docs/guides/exporters.md        |  27 ++++
+ docs/reference/architecture.md  |   1 +
+ docs/reference/cli.md           |   1 +
+ docs/reference/configuration.md |   1 +
+ tests/unit/test_splits.py       | 261 ++++++++++++++++++++++++++++++++
+ 10 files changed, 545 insertions(+), 39 deletions(-)
+ create mode 100644 curatorkit/splits.py
+ create mode 100644 tests/unit/test_splits.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 95977c4..b5ee815 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -23,6 +23,13 @@ All notable changes to CuratorKIT are documented here. The format follows
+   from/value instead of being copied through as-is.
+ 
+ ### Added
++- `output_split_group` (`CuratorConfig`, YAML): a metadata key whose value keeps a group in one
++  split, so the translations or paraphrases of an item can't land in both train and test. A group's
++  split is a hash of its id and `output_split_seed`, so an item keeps its split as the corpus grows,
++  and split sizes only approximate the fractions. Without it, splitting is unchanged.
++- `curatorkit.splits`: `split_samples` (now the one split path for `Curator` and `curatorkit run`)
++  and `leakage_report`, which finds groups, exact prompts and near-duplicate prompts in more than one
++  split. A grouped run warns when it finds any.
+ - `messages` exporter (`sft_messages.jsonl`): the same turns as chat `messages`
+   (`[{"role", "content"}, ...]`), the layout TRL's `SFTTrainer` and tokenizer chat templates take
+   directly. Auto-resolved `export_formats` include it wherever `sharegpt` is chosen.
+diff --git a/curatorkit/cli.py b/curatorkit/cli.py
+index 6fcbe0a..7532440 100644
+--- a/curatorkit/cli.py
++++ b/curatorkit/cli.py
+@@ -160,8 +160,7 @@ def run(
+ 
+     # Output split — shuffle accepted samples and export each split to a subdir
+     if splitting:
+-        import math
+-        import random as _random
++        from curatorkit.splits import split_samples, warn_on_leakage
+ 
+         split_def = config.output_split
+         total_frac = sum(split_def.values())
+@@ -172,23 +171,24 @@ def run(
+             )
+             raise typer.Exit(1)
+ 
+-        shuffled = list(result.passed)
+-        _random.Random(getattr(config, "output_split_seed", 42)).shuffle(shuffled)
+-        n = len(shuffled)
+-        start = 0
+-        split_items = list(split_def.items())
+-        for i, (split_name, fraction) in enumerate(split_items):
+-            end = n if i == len(split_items) - 1 else start + math.floor(n * fraction)
+-            split_samples = shuffled[start:end]
++        group_key = getattr(config, "output_split_group", None)
++        splits = split_samples(
++            result.passed,
++            split_def,
++            seed=getattr(config, "output_split_seed", 42),
++            group_key=group_key,
++        )
++        if group_key:
++            warn_on_leakage(splits, group_key)
++        for split_name, rows in splits.items():
+             split_dir = output_dir / split_name
+             split_dir.mkdir(parents=True, exist_ok=True)
+             for e in config.exporters:
+                 cls = EXPORTERS.get(e.type)
+                 if cls:
+-                    cls().export(split_samples, split_dir)
++                    cls().export(rows, split_dir)
+             if verbose:
+-                typer.echo(f"  {split_name}: {len(split_samples):,} samples → {split_dir}/")
+-            start = end
++                typer.echo(f"  {split_name}: {len(rows):,} samples → {split_dir}/")
+ 
+     provenance = build_provenance(
+         method=",".join(g.type for g in config.generators) or "curate",
+@@ -197,6 +197,7 @@ def run(
+             **step_models(steps),
+             "export_formats": [e.type for e in config.exporters],
+             "output_split": config.output_split,
++            "output_split_group": getattr(config, "output_split_group", None),
+             "pipeline_config_hash": config_hash,
+         },
+     )
+diff --git a/curatorkit/config.py b/curatorkit/config.py
+index 535172f..e5f12e0 100644
+--- a/curatorkit/config.py
++++ b/curatorkit/config.py
+@@ -472,6 +472,7 @@ class PipelineConfig(BaseModel):
+     # Example: {train: 0.8, val: 0.1, test: 0.1}
+     output_split: dict[str, float] | None = None
+     output_split_seed: int = 42  # seed for the pre-split shuffle
++    output_split_group: str | None = None  # metadata key; a group stays in one split
+     # Also write README.md with load_dataset configs; a user's own README.md is never overwritten.
+     write_hf_readme: bool = True
+ 
+diff --git a/curatorkit/curator.py b/curatorkit/curator.py
+index 4fb49f6..17e1456 100644
+--- a/curatorkit/curator.py
++++ b/curatorkit/curator.py
+@@ -250,6 +250,9 @@ class CuratorConfig:
+     # Example: {"train": 0.8, "val": 0.1, "test": 0.1}
+     output_split: dict[str, float] | None = None
+     output_split_seed: int = 42  # seed for the pre-split shuffle
++    # output_split_group: a metadata key (an input column ends up in metadata). Every
++    # sample sharing its value lands in one split, so translations can't straddle them.
++    output_split_group: str | None = None
+     # Also write README.md (dataset card + load_dataset configs). An existing
+     # README.md that curatorkit did not write is never overwritten.
+     write_hf_readme: bool = True
+@@ -1704,48 +1707,34 @@ class Curator:
+         self, samples: list, output_dir: Path, formats: list[str] | None = None
+     ) -> None:
+         """Split accepted samples and export each split to suffixed files."""
+-        import math
+-        import random as _random
++        from curatorkit.splits import split_samples, warn_on_leakage
+ 
+         if formats is None:
+             formats = self._resolve_export_formats()
+ 
+-        split_def = self.config.output_split  # e.g. {"train": 0.8, "val": 0.1, "test": 0.1}
+-        total = sum(split_def.values())
+-        if abs(total - 1.0) > 1e-6:
+-            raise ValueError(
+-                f"output_split fractions must sum to 1.0, got {total:.4f}. "
+-                f"Adjust your split ratios."
+-            )
+-
+-        shuffled = list(samples)
+-        _random.Random(self.config.output_split_seed).shuffle(shuffled)
+-        n = len(shuffled)
++        cfg = self.config
++        splits = split_samples(
++            samples,
++            cfg.output_split,  # e.g. {"train": 0.8, "val": 0.1, "test": 0.1}
++            seed=cfg.output_split_seed,
++            group_key=cfg.output_split_group,
++        )
++        if cfg.output_split_group:
++            warn_on_leakage(splits, cfg.output_split_group)
+ 
+         _exporter_map = _exporter_classes()
+ 
+-        start = 0
+-        split_items = list(split_def.items())
+-        for i, (split_name, fraction) in enumerate(split_items):
+-            # Last split gets all remaining samples to avoid rounding loss
+-            if i == len(split_items) - 1:
+-                end = n
+-            else:
+-                end = start + math.floor(n * fraction)
+-
+-            split_samples = shuffled[start:end]
++        for split_name, rows in splits.items():
+             split_dir = output_dir / split_name
+             split_dir.mkdir(parents=True, exist_ok=True)
+ 
+             for fmt in formats:
+                 cls = _exporter_map.get(fmt.lower())
+                 if cls:
+-                    cls().export(split_samples, split_dir)
++                    cls().export(rows, split_dir)
+                 else:
+                     warnings.warn(f"Unknown export format '{fmt}' — skipped.")
+ 
+-            start = end
+-
+     def _write_provenance(self, result, output_dir: Path, steps: list | None = None) -> None:
+         from curatorkit.manifest import (
+             DatasetCardGenerator,
+@@ -1773,6 +1762,7 @@ class Curator:
+                     {s.task_type for s in result.passed}
+                 ),
+                 "output_split": cfg.output_split,
++                "output_split_group": cfg.output_split_group,
+                 "pipeline_config_hash": cfg_hash,
+             },
+         )
+diff --git a/curatorkit/splits.py b/curatorkit/splits.py
+new file mode 100644
+index 0000000..cc4d6e8
+--- /dev/null
++++ b/curatorkit/splits.py
+@@ -0,0 +1,216 @@
++"""Train/val/test splits, kept apart by group, and a check for leakage between them.
++
++A per-sample shuffle can put the translations or paraphrases of one item on both sides of
++a split, so a test score then measures memorisation. With a group key, every sample of a
++group lands in the same split.
++
++A group's split comes from a hash of its id, so it depends only on the group and the seed:
++an item stays in its split when the corpus grows, which a shuffle can't promise. The cost
++is that split sizes only approximate the fractions, more loosely with few groups.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++import random
++import warnings
++from collections import defaultdict
++from collections.abc import Iterable
++
++from curatorkit.normalizers.dedup import (
++    _band_keys,
++    _jaccard_estimate,
++    _make_hash_funcs,
++    _minhash_signature,
++    _ngrams,
++    _pick_bands,
++    _sample_dedup_text,
++)
++from curatorkit.schema import DataSample
++
++
++def _unit(seed: int, group: str) -> float:
++    """A stable number in [0, 1) for ``group``. ``hash()`` changes between processes."""
++    digest = hashlib.sha256(f"split:{seed}:{group}".encode()).digest()
++    return int.from_bytes(digest[:8], "big") / 2**64
++
++
++def _group_of(sample: DataSample, group_key: str) -> str | None:
++    value = sample.metadata.get(group_key)
++    return None if value is None or value == "" else str(value)
++
++
++def _grouped_split(
++    samples: list[DataSample], fractions: dict[str, float], seed: int, group_key: str
++) -> dict[str, list[DataSample]]:
++    missing = sum(_group_of(s, group_key) is None for s in samples)
++    if samples and missing == len(samples):
++        raise ValueError(
++            f"output_split_group: no sample has metadata[{group_key!r}]. "
++            f"Check the key; a sample's input columns are kept in metadata."
++        )
++    if missing:
++        warnings.warn(
++            f"output_split_group: {missing} of {len(samples)} samples have no "
++            f"metadata[{group_key!r}], so each of those is split on its own text.",
++            stacklevel=3,
++        )
++
++    names = list(fractions)
++    bounds, total = [], 0.0
++    for name in names[:-1]:
++        total += fractions[name]
++        bounds.append(total)
++
++    out: dict[str, list[DataSample]] = {name: [] for name in names}
++    for sample in samples:
++        # Ids are random by default, so an ungrouped sample is keyed on its text instead.
++        group = _group_of(sample, group_key) or f"text:{_sample_dedup_text(sample)}"
++        unit = _unit(seed, group)
++        out[names[sum(unit >= bound for bound in bounds)]].append(sample)
++
++    empty = [name for name, rows in out.items() if not rows]
++    if samples and empty:
++        warnings.warn(
++            f"output_split_group: split(s) {empty} are empty; there are too few groups "
++            f"for these fractions.",
++            stacklevel=3,
++        )
++    return out
++
++
++def split_samples(
++    samples: Iterable[DataSample],
++    fractions: dict[str, float],
++    *,
++    seed: int = 42,
++    group_key: str | None = None,
++) -> dict[str, list[DataSample]]:
++    """Split ``samples`` into ``{split name: samples}``.
++
++    Without ``group_key``, a seeded shuffle gives exact sizes, and the last split takes
++    the rounding remainder. With it, every sample sharing ``metadata[group_key]`` lands in
++    the same split (see the module docstring). A sample with no value there is split on
++    its own text, with a warning. No sample having one is taken for a wrong key and
++    raises ``ValueError``, as do fractions that don't sum to 1.0.
++    """
++    total = sum(fractions.values())
++    if abs(total - 1.0) > 1e-6:
++        raise ValueError(
++            f"output_split fractions must sum to 1.0, got {total:.4f}. "
++            f"Adjust your split ratios."
++        )
++    rows = list(samples)
++    if group_key:
++        return _grouped_split(rows, fractions, seed, group_key)
++
++    random.Random(seed).shuffle(rows)
++    out: dict[str, list[DataSample]] = {}
++    start = 0
++    items = list(fractions.items())
++    for i, (name, fraction) in enumerate(items):
++        end = len(rows) if i == len(items) - 1 else start + math.floor(len(rows) * fraction)
++        out[name] = rows[start:end]
++        start = end
++    return out
++
++
++def _prompt_text(sample: DataSample) -> str:
++    """What the model is shown, normalised. One prompt with two answers still leaks, so
++    this leaves out the answer that ``_sample_dedup_text`` includes, unless there's no
++    prompt to compare."""
++    text = f"{sample.instruction} {sample.input}".strip() or _sample_dedup_text(sample)
++    return " ".join(text.split()).casefold()
++
++
++def _near_duplicates(
++    rows: list[tuple[str, DataSample, str]], threshold: float, num_perm: int, seed: int
++) -> list[tuple[str, str, float]]:
++    funcs = _make_hash_funcs(num_perm, seed)
++    bands, width = _pick_bands(num_perm, threshold)
++    signatures: dict[int, list[int]] = {}
++    # One representative per split in each bucket keeps this linear in the samples: on a
++    # templated corpus most prompts share a bucket, and comparing all pairs would be quadratic.
++    buckets: dict[tuple, dict[str, int]] = defaultdict(dict)
++    found: dict[tuple[int, int], float] = {}
++    for i, (split, _, text) in enumerate(rows):
++        grams = _ngrams(text)
++        if not grams:  # shorter than an n-gram: an empty signature would match every other
++            continue
++        signature = signatures[i] = _minhash_signature(grams, funcs)
++        for band, key in enumerate(_band_keys(signature, bands, width)):
++            bucket = buckets[(band, key)]
++            for other_split, j in bucket.items():
++                if other_split == split or rows[j][2] == text or (j, i) in found:
++                    continue  # same split, or an exact duplicate, which is reported on its own
++                score = _jaccard_estimate(signatures[j], signature)
++                if score >= threshold:
++                    found[(j, i)] = score
++            bucket.setdefault(split, i)
++    return [(rows[a][1].id, rows[b][1].id, score) for (a, b), score in sorted(found.items())]
++
++
++def leakage_report(
++    splits: dict[str, list[DataSample]],
++    *,
++    group_key: str | None = None,
++    near_dup_threshold: float | None = 0.8,
++    num_perm: int = 128,
++    seed: int = 42,
++) -> dict:
++    """Check that nothing appears in more than one split.
++
++    Returns ``groups_in_multiple_splits`` (only with ``group_key``), ``exact_duplicates``
++    and ``near_duplicates`` (sample-id pairs, near ones with their estimated Jaccard
++    similarity), and ``ok``. Prompts are compared after folding case and whitespace.
++    Text matching can't see a translation, so only a group key catches those.
++
++    Near duplicates come from MinHash, so they are approximate, and a templated corpus
++    reports some of its pairs rather than all of them. The pass costs about as much as
++    MinHash dedup; ``near_dup_threshold=None`` skips it.
++    """
++    rows = [(name, s, _prompt_text(s)) for name, samples in splits.items() for s in samples]
++
++    groups: dict[str, set[str]] = defaultdict(set)
++    if group_key:
++        for name, sample, _ in rows:
++            group = _group_of(sample, group_key)
++            if group is not None:
++                groups[group].add(name)
++    in_several = sorted(group for group, names in groups.items() if len(names) > 1)
++
++    first_seen: dict[str, dict[str, str]] = defaultdict(dict)
++    for name, sample, text in rows:
++        first_seen[text].setdefault(name, sample.id)
++    exact = [
++        (ids[a], ids[b])
++        for ids in (first_seen[text] for text in first_seen if text)
++        for a, b in zip(list(ids), list(ids)[1:])
++    ]
++
++    near = (
++        _near_duplicates(rows, near_dup_threshold, num_perm, seed)
++        if near_dup_threshold is not None
++        else []
++    )
++    return {
++        "groups_in_multiple_splits": in_several,
++        "exact_duplicates": exact,
++        "near_duplicates": near,
++        "ok": not (in_several or exact or near),
++    }
++
++
++def warn_on_leakage(splits: dict[str, list[DataSample]], group_key: str | None = None) -> dict:
++    """Run :func:`leakage_report` and warn when it finds anything."""
++    report = leakage_report(splits, group_key=group_key)
++    if not report["ok"]:
++        warnings.warn(
++            f"output_split leakage: {len(report['groups_in_multiple_splits'])} groups, "
++            f"{len(report['exact_duplicates'])} exact and "
++            f"{len(report['near_duplicates'])} near-duplicate prompts are in more than one "
++            f"split. Use curatorkit.splits.leakage_report for the sample ids.",
++            stacklevel=2,
++        )
++    return report
+diff --git a/docs/guides/exporters.md b/docs/guides/exporters.md
+index fbab6f3..ebd1fcd 100644
+--- a/docs/guides/exporters.md
++++ b/docs/guides/exporters.md
+@@ -152,6 +152,33 @@ CuratorConfig(
+ )
+ ```
+ 
++To keep related samples together, name a metadata key in `output_split_group`. Every sample
++sharing its value lands in the same split, so the translations of a prompt can't end up in both
++train and test. An input column that isn't mapped to a field is kept in `metadata`, so the key is
++usually a column name:
++
++```python
++CuratorConfig(
++    output_split       = {"train": 0.9, "test": 0.1},
++    output_split_group = "group",
++)
++```
++
++A group's split is a hash of its id and `output_split_seed`, so an item keeps its split as the
++corpus grows. Split sizes then only approximate the fractions, more loosely with few groups. A
++sample with no value is split on its own text, with a warning, and a key that no sample has raises
++an error. A grouped run also warns if any group, identical prompt or near-duplicate prompt is in
++more than one split. To run that check yourself:
++
++```python
++from curatorkit.splits import leakage_report, split_samples
++
++splits = split_samples(result.passed, {"train": 0.9, "test": 0.1}, group_key="group")
++report = leakage_report(splits, group_key="group")  # groups, exact and near duplicates, "ok"
++```
++
++Text matching can't see a translation, so only a group key catches those.
++
+ Output structure:
+ ```
+ output/
+diff --git a/docs/reference/architecture.md b/docs/reference/architecture.md
+index e716296..8a22f03 100644
+--- a/docs/reference/architecture.md
++++ b/docs/reference/architecture.md
+@@ -523,6 +523,7 @@ version: "0.2.0"
+ max_samples: null              # cap on total samples, applied right after readers
+ output_split: null             # e.g. {train: 0.8, val: 0.1, test: 0.1}; fractions sum to 1.0
+ output_split_seed: 42
++output_split_group: null       # metadata key; samples sharing its value stay in one split
+ 
+ readers:
+   - type: jsonl | json | csv | parquet | huggingface | pdf
+diff --git a/docs/reference/cli.md b/docs/reference/cli.md
+index 908f428..717b22a 100644
+--- a/docs/reference/cli.md
++++ b/docs/reference/cli.md
+@@ -206,6 +206,7 @@ llm:
+ | `diagnostic` | DiagnosticConfig | null | Inline probe config |
+ | `max_samples` | int | null | Cap total samples after all readers |
+ | `output_split` | dict[str, float] | null | Train/val/test split fractions (must sum to 1.0) |
++| `output_split_group` | str | null | Metadata key that keeps a group in one split |
+ 
+ ### Reader types
+ 
+diff --git a/docs/reference/configuration.md b/docs/reference/configuration.md
+index eaa42a9..1efa5cd 100644
+--- a/docs/reference/configuration.md
++++ b/docs/reference/configuration.md
+@@ -117,6 +117,7 @@ for full usage examples.
+ | `export_formats` | `list[str] \| None` | `None` (auto) | Which exporters to run. Options: `"alpaca"`, `"sharegpt"`, `"dpo"`, `"grpo"`, `"ppo"`, `"corpus"`. `None` auto-aligns to whichever task_type `generation_task` produces, or (with no `generation_task`) to whatever task_type the readers actually emit — see [Exporters → Compatibility](../guides/exporters.md#compatibility-matrix). Set explicitly to override. |
+ | `output_split` | `dict[str, float] \| None` | `None` | Split accepted samples into subdirectories. E.g. `{"train": 0.8, "val": 0.1, "test": 0.1}`. Must sum to 1.0. |
+ | `output_split_seed` | `int` | `42` | Seed for the pre-split shuffle. Set the same value across runs to get identical train/val/test assignments. |
++| `output_split_group` | `str \| None` | `None` | Metadata key that keeps a group in one split, so translations can't land in both. Split sizes then only approximate the fractions. See [Train / val / test splits](../guides/exporters.md#train-val-test-splits). |
+ | `write_hf_readme` | `bool` | `True` | Also write `README.md` with `load_dataset` configs. An existing `README.md` that CuratorKIT did not write is never overwritten. Also a YAML top-level key. |
+ 
+ ---
+diff --git a/tests/unit/test_splits.py b/tests/unit/test_splits.py
+new file mode 100644
+index 0000000..3e96326
+--- /dev/null
++++ b/tests/unit/test_splits.py
+@@ -0,0 +1,261 @@
++"""Tests for group-aware splits and the leakage check."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++import random
++import warnings
++from collections import Counter
++
++import pytest
++from typer.testing import CliRunner
++
++from curatorkit import Curator, CuratorConfig
++from curatorkit.schema import DataSample
++from curatorkit.splits import leakage_report, split_samples, warn_on_leakage
++
++FRACTIONS = {"train": 0.8, "val": 0.1, "test": 0.1}
++
++
++def _sample(text, group=None, **fields):
++    metadata = {} if group is None else {"group": group}
++    return DataSample(source_uri="test", instruction=text, output="An answer.", metadata=metadata,
++                      **fields)
++
++
++def _translated(groups=300, languages=("en", "hi", "bn")):
++    return [_sample(f"item {g} in {lang}", group=f"g{g}") for g in range(groups) for lang in languages]
++
++
++def _membership(splits):
++    return {s.instruction: name for name, rows in splits.items() for s in rows}
++
++
++class TestShuffleSplit:
++    def test_matches_the_previous_seeded_shuffle(self):
++        samples = [_sample(f"item {i}") for i in range(23)]
++        shuffled = list(samples)
++        random.Random(7).shuffle(shuffled)
++        n = len(shuffled)
++        train, val = math.floor(n * 0.8), math.floor(n * 0.1)
++        splits = split_samples(samples, FRACTIONS, seed=7)
++        assert splits["train"] == shuffled[:train]
++        assert splits["val"] == shuffled[train : train + val]
++        assert splits["test"] == shuffled[train + val :]
++
++    @pytest.mark.parametrize("group_key", [None, "group"])
++    def test_fractions_must_sum_to_one(self, group_key):
++        with pytest.raises(ValueError, match="must sum to 1.0"):
++            split_samples([_sample("x", "g")], {"train": 0.8, "val": 0.1}, group_key=group_key)
++
++
++class TestGroupSplit:
++    def test_every_sample_of_a_group_lands_in_one_split(self):
++        splits = split_samples(_translated(), FRACTIONS, group_key="group")
++        seen: dict[str, set] = {}
++        for name, rows in splits.items():
++            for sample in rows:
++                seen.setdefault(sample.metadata["group"], set()).add(name)
++        assert len(seen) == 300
++        assert all(len(names) == 1 for names in seen.values())
++
++    def test_a_per_sample_shuffle_would_have_leaked_here(self):
++        splits = split_samples(_translated(), FRACTIONS)
++        assert leakage_report(splits, group_key="group", near_dup_threshold=None)[
++            "groups_in_multiple_splits"]
++
++    def test_sizes_approximate_the_fractions(self):
++        sizes = Counter({k: len(v) for k, v in split_samples(
++            _translated(2000, ("en",)), FRACTIONS, group_key="group").items()})
++        assert sizes["train"] == pytest.approx(1600, abs=80)
++        assert sizes["val"] == pytest.approx(200, abs=60)
++        assert sum(sizes.values()) == 2000
++
++    def test_the_same_seed_gives_the_same_split_and_another_seed_does_not(self):
++        first = _membership(split_samples(_translated(), FRACTIONS, group_key="group", seed=1))
++        again = _membership(split_samples(_translated(), FRACTIONS, group_key="group", seed=1))
++        other = _membership(split_samples(_translated(), FRACTIONS, group_key="group", seed=2))
++        assert first == again
++        assert first != other
++
++    def test_an_item_keeps_its_split_when_the_corpus_grows(self):
++        small = _membership(split_samples(_translated(100), FRACTIONS, group_key="group"))
++        large = _membership(split_samples(_translated(400), FRACTIONS, group_key="group"))
++        assert all(large[text] == name for text, name in small.items())
++
++    def test_input_order_is_kept_within_a_split(self):
++        samples = _translated(50)
++        splits = split_samples(samples, FRACTIONS, group_key="group")
++        order = {id(s): i for i, s in enumerate(samples)}
++        for rows in splits.values():
++            assert [order[id(s)] for s in rows] == sorted(order[id(s)] for s in rows)
++
++    @pytest.mark.filterwarnings("ignore:output_split_group")
++    def test_group_values_need_not_be_strings(self):
++        samples = [_sample("a", 7), _sample("b", 7), _sample("c", 0)]
++        splits = split_samples(samples, {"x": 0.5, "y": 0.5}, group_key="group")
++        assert len({name for name, rows in splits.items() for s in rows if s.metadata["group"] == 7}) == 1
++        assert sum(len(rows) for rows in splits.values()) == 3
++
++    def test_a_key_no_sample_has_is_an_error(self):
++        with pytest.raises(ValueError, match="no sample has metadata\\['grp'\\]"):
++            split_samples(_translated(5), FRACTIONS, group_key="grp")
++
++    def test_a_sample_without_a_group_warns_and_is_split_on_its_text(self):
++        samples = [_sample("a", "g1"), _sample("b"), _sample("b"), _sample("c", "")]
++        with pytest.warns(UserWarning, match="3 of 4 samples have no"):
++            first = split_samples(samples, {"x": 0.5, "y": 0.5}, group_key="group")
++        names = [name for name, rows in first.items() for s in rows if s.instruction == "b"]
++        assert len(set(names)) == 1  # identical text stays together, though the ids differ
++
++    def test_too_few_groups_for_the_fractions_warns(self):
++        with pytest.warns(UserWarning, match="are empty"):
++            split_samples([_sample("a", "only")], FRACTIONS, group_key="group")
++
++    def test_no_samples_is_not_an_error(self):
++        assert split_samples([], FRACTIONS, group_key="group") == {"train": [], "val": [], "test": []}
++
++
++class TestLeakageReport:
++    def test_clean_splits(self):
++        splits = {"train": [_sample("first prompt here", "a")], "test": [_sample("another one", "b")]}
++        report = leakage_report(splits, group_key="group")
++        assert report == {"groups_in_multiple_splits": [], "exact_duplicates": [],
++                          "near_duplicates": [], "ok": True}
++
++    def test_a_group_on_both_sides(self):
++        splits = {"train": [_sample("in English", "g")], "test": [_sample("auf Deutsch", "g")]}
++        report = leakage_report(splits, group_key="group")
++        assert report["groups_in_multiple_splits"] == ["g"]
++        assert report["ok"] is False
++
++    def test_text_alone_can_not_see_a_translation(self):
++        splits = {"train": [_sample("in English", "g")], "test": [_sample("auf Deutsch", "g")]}
++        assert leakage_report(splits)["ok"] is True
++
++    def test_exact_duplicates_ignore_case_and_spacing(self):
++        a, b = _sample("Tell me  about Rain"), _sample("tell me about rain")
++        report = leakage_report({"train": [a], "test": [b]}, near_dup_threshold=None)
++        assert report["exact_duplicates"] == [(a.id, b.id)]
++
++    def test_one_prompt_with_two_answers_still_leaks(self):
++        a = DataSample(source_uri="t", instruction="same prompt", output="one answer")
++        b = DataSample(source_uri="t", instruction="same prompt", output="a different answer")
++        assert leakage_report({"train": [a], "test": [b]})["exact_duplicates"] == [(a.id, b.id)]
++
++    def test_a_sample_with_no_prompt_is_compared_on_its_text(self):
++        a = DataSample(source_uri="t", task_type="language_modeling", output="the same long text")
++        b = DataSample(source_uri="t", task_type="language_modeling", output="the same long text")
++        assert leakage_report({"train": [a], "test": [b]})["exact_duplicates"] == [(a.id, b.id)]
++
++    def test_a_duplicate_inside_one_split_is_not_a_leak(self):
++        assert leakage_report({"train": [_sample("same"), _sample("same")], "test": []})["ok"] is True
++
++    def test_near_duplicates_are_found_with_their_similarity(self):
++        text = "Explain how a bicycle stays upright while it is moving down a long straight road"
++        a, b = _sample(text), _sample(text + " today")
++        report = leakage_report({"train": [a], "test": [b]})
++        assert report["exact_duplicates"] == []
++        ((first, second, similarity),) = report["near_duplicates"]
++        assert (first, second) == (a.id, b.id)
++        assert similarity >= 0.8
++
++    def test_unrelated_text_and_tiny_prompts_are_not_near_duplicates(self):
++        splits = {"train": [_sample("How do tides work near the coast of Norway"), _sample("a")],
++                  "test": [_sample("Write a poem about a quiet library in autumn"), _sample("b")]}
++        assert leakage_report(splits)["near_duplicates"] == []
++
++    def test_a_templated_corpus_stays_linear(self):
++        """All pairs here would be about 40,000, and quadratic work on a large corpus."""
++        rows = [_sample(f"Explain topic number {i} in a few clear and simple sentences please")
++                for i in range(400)]
++        report = leakage_report({"train": rows[:200], "test": rows[200:]}, num_perm=16)
++        assert 0 < len(report["near_duplicates"]) < 400 * 16
++        assert report["ok"] is False
++
++    def test_the_near_duplicate_pass_can_be_skipped(self):
++        text = "Explain how a bicycle stays upright while it is moving down a long straight road"
++        splits = {"train": [_sample(text)], "test": [_sample(text + " today")]}
++        assert leakage_report(splits, near_dup_threshold=None)["ok"] is True
++
++    def test_warn_on_leakage(self):
++        with pytest.warns(UserWarning, match="1 exact"):
++            report = warn_on_leakage({"train": [_sample("same")], "test": [_sample("same")]})
++        assert report["ok"] is False
++
++
++def _words(key, n=14):
++    """Text unlike any other key's, so a clean split has no near duplicates to report."""
++    return " ".join(hashlib.sha256(f"{key}/{i}".encode()).hexdigest()[:9] for i in range(n))
++
++
++def _seed(path, groups=40):
++    with open(path, "w", encoding="utf-8") as f:
++        for g in range(groups):
++            for lang in ("en", "hi"):
++                f.write(json.dumps({
++                    "instruction": f"number {g} {_words((g, lang))}",
++                    "output": _words((g, lang, "output")),
++                    "group": f"g{g}",
++                }) + "\n")
++
++
++def _groups_per_split(out, names):
++    seen: dict[str, set] = {}
++    for name in names:
++        for line in (out / name / "sft_alpaca.jsonl").read_text(encoding="utf-8").splitlines():
++            number = json.loads(line)["instruction"].split("number ")[1].split(" ")[0]
++            seen.setdefault(number, set()).add(name)
++    return seen
++
++
++class TestPipeline:
++    def test_curator_keeps_a_group_together_from_an_input_column(self, tmp_path):
++        seed = tmp_path / "seed.jsonl"
++        _seed(seed)
++        out = tmp_path / "out"
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", UserWarning)  # no leak warning on a clean split
++            Curator(CuratorConfig(
++                dataset=str(seed), output_dir=str(out), export_formats=["alpaca"], dedup=False,
++                output_split={"train": 0.75, "test": 0.25}, output_split_group="group",
++            )).run()
++        seen = _groups_per_split(out, ["train", "test"])
++        assert len(seen) == 40
++        assert all(len(names) == 1 for names in seen.values())
++        provenance = json.loads((out / "lexsi_provenance.json").read_text(encoding="utf-8"))
++        assert provenance["params"]["output_split_group"] == "group"
++
++    def test_yaml_runs_take_the_same_path(self, tmp_path):
++        from curatorkit.cli import app
++
++        seed = tmp_path / "seed.jsonl"
++        _seed(seed)
++        (tmp_path / "p.yaml").write_text(
++            f"readers:\n- type: jsonl\n  path: {seed.as_posix()}\n"
++            "exporters:\n- type: alpaca\n"
++            "output_split: {train: 0.75, test: 0.25}\n"
++            "output_split_group: group\n", encoding="utf-8")
++        out = tmp_path / "out"
++        result = CliRunner().invoke(app, ["run", str(tmp_path / "p.yaml"), "-o", str(out)])
++        assert result.exit_code == 0, result.output
++        seen = _groups_per_split(out, ["train", "test"])
++        assert len(seen) == 40
++        assert all(len(names) == 1 for names in seen.values())
++
++    def test_duplicates_across_groups_warn(self, tmp_path):
++        seed = tmp_path / "seed.jsonl"
++        with open(seed, "w", encoding="utf-8") as f:
++            for g in range(40):
++                f.write(json.dumps({
++                    "instruction": "The very same prompt repeated under a different group id each time.",
++                    "output": f"Answer number {g} is written out here in several plain words for you.",
++                    "group": f"g{g}",
++                }) + "\n")
++        with pytest.warns(UserWarning, match="output_split leakage"):
++            Curator(CuratorConfig(
++                dataset=str(seed), output_dir=str(tmp_path / "out"), export_formats=["alpaca"],
++                dedup=False, output_split={"train": 0.5, "test": 0.5}, output_split_group="group",
++            )).run()

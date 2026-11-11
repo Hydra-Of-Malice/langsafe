@@ -1,0 +1,1095 @@
+diff --git a/scripts/check_nf4_environment.py b/scripts/check_nf4_environment.py
+new file mode 100755
+index 0000000..9fafacd
+--- /dev/null
++++ b/scripts/check_nf4_environment.py
+@@ -0,0 +1,543 @@
++#!/usr/bin/env python3
++"""Offline CUDA/NF4 handoff planner and fail-closed executor.
++
++--dry-run only reads files/package metadata; it never imports torch, loads a model,
++contacts a service, creates the destination, or claims that NF4 ran.
++"""
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib.metadata
++import json
++import os
++import platform
++import re
++import shutil
++import subprocess
++import sys
++from datetime import datetime, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / 'src'))
++GIB = 1 << 30
++
++
++def sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with path.open('rb') as stream:
++        for chunk in iter(lambda: stream.read(4 << 20), b''):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def digest(value) -> str:
++    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
++
++
++def read_json(path: Path):
++    if not path.is_file():
++        raise ValueError(f'Required artifact is missing: {path}')
++    return json.loads(path.read_text(encoding='utf-8'))
++
++
++def rows(path: Path) -> list[dict]:
++    if not path.is_file():
++        raise ValueError(f'Required prompt/evaluation artifact is missing: {path}')
++    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines() if line.strip()]
++
++
++def safe_tag(tag: str) -> str:
++    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', tag) or '..' in tag:
++        raise ValueError(f'Invalid selected tag: {tag!r}')
++    return tag
++
++
++def capability_file(tag: str, preamble: str) -> Path:
++    return Path('capability') / (tag + ('.none' if preamble == 'none' else '') + '.json')
++
++
++def checkpoint(model: str) -> tuple[Path, dict]:
++    """Resolve only local directories/Hub cache; hash every checkpoint/tokenizer file."""
++    from langsafe.gen.model import resolve_model
++
++    path = Path(resolve_model(model)).expanduser()
++    if not path.is_dir():
++        from huggingface_hub import try_to_load_from_cache
++
++        config = try_to_load_from_cache(model, 'config.json')
++        if not isinstance(config, str):
++            raise ValueError(f'Checkpoint is not cached; provision it before this offline run: {model}')
++        path = Path(config).parent
++    path = path.resolve()
++    if not (path / 'config.json').is_file() or not (path / 'tokenizer_config.json').is_file():
++        raise ValueError(f'Incomplete checkpoint config/tokenizer: {path}')
++    if not any((path / name).is_file() for name in ('tokenizer.json', 'tokenizer.model', 'spiece.model')):
++        raise ValueError(f'Incomplete checkpoint tokenizer: {path}')
++    indexes = list(path.glob('*.safetensors.index.json'))
++    weights = sorted(path.glob('*.safetensors'))
++    if not weights:
++        raise ValueError(f'Checkpoint requires safetensors weights: {path}')
++    for index in indexes:
++        for name in set(read_json(index).get('weight_map', {}).values()):
++            if Path(name).name != name or not (path / name).is_file():
++                raise ValueError(f'Incomplete checkpoint shard: {path / name}')
++    files = {str(file.relative_to(path)): {'sha256': sha256(file), 'bytes': file.stat().st_size}
++             for file in sorted(path.rglob('*')) if file.is_file() and '.cache' not in file.relative_to(path).parts}
++    return path, {'resolved_path': str(path), 'snapshot_revision': path.name if path.parent.name == 'snapshots' else None,
++                  'files': files, 'content_sha256': digest(files),
++                  'bytes': sum(file['bytes'] for file in files.values())}
++
++
++def checkpoint_content(identity: dict) -> dict:
++    """Drop machine-specific paths before comparing a transferred snapshot."""
++    return {key: value for key, value in identity.items() if key != 'resolved_path'}
++
++
++def software() -> dict:
++    result = {'python': platform.python_version(), 'platform': platform.platform(), 'machine': platform.machine()}
++    for package in ('langsafe', 'torch', 'transformers', 'accelerate', 'bitsandbytes', 'datasets',
++                    'huggingface_hub', 'auditkit', 'numpy', 'pyyaml'):
++        try:
++            result[package] = importlib.metadata.version(package)
++        except importlib.metadata.PackageNotFoundError:
++            result[package] = None
++    return result
++
++
++def code_identity() -> dict:
++    paths = [*ROOT.glob('src/langsafe/**/*.py'), ROOT / 'pyproject.toml',
++             ROOT / 'scripts/run_nf4_evaluation.sh', Path(__file__).resolve()]
++    files = {str(path.relative_to(ROOT)): sha256(path) for path in sorted(paths) if path.is_file()}
++    commit = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, capture_output=True, text=True, check=False)
++    return {'git_commit': commit.stdout.strip() if commit.returncode == 0 else None,
++            'files_sha256': files, 'content_sha256': digest(files)}
++
++
++def check_source(source: Path, spec: dict, family: str, judge_set: str) -> tuple[dict, list[dict], dict]:
++    """Validate source evidence before any accelerator or destination activity."""
++    from langsafe.config import spec_digest
++
++    manifest = read_json(source / 'data/manifest.json')
++    if manifest.get('spec_digest') != spec_digest(spec):
++        raise ValueError('Source data spec digest does not match --spec; do not mix experiment profiles')
++    if manifest.get('family') != family or not manifest.get('leakage_check', {}).get('ok'):
++        raise ValueError('Source family/leakage evidence is missing or mismatched')
++    if not manifest.get('coverage', {}).get('complete'):
++        raise ValueError('Source data coverage is incomplete; finish the source experiment data first')
++    split_rows = {}
++    for split in ('heldout', 'repair'):
++        path = source / 'data' / f'{split}.jsonl'
++        info = manifest.get('files', {}).get(split, {})
++        if not path.is_file() or sha256(path) != info.get('sha256'):
++            raise ValueError(f'Source {split} data hash does not match its manifest')
++        split_rows[split] = rows(path)
++        if len(split_rows[split]) != info.get('rows') or not split_rows[split]:
++            raise ValueError(f'Source {split} prompt count does not match manifest')
++        if any(row.get('split') != split for row in split_rows[split]):
++            raise ValueError(f'Source {split} prompt split is incorrect')
++        ids = [row['id'] for row in split_rows[split]]
++        if len(ids) != len(set(ids)):
++            raise ValueError(f'Source {split} prompt identities are duplicated')
++    if {row['group'] for row in split_rows['heldout']} & {row['group'] for row in split_rows['repair']}:
++        raise ValueError('Source repair/heldout prompt groups overlap')
++    selection = read_json(source / 'selection.json')
++    selected = selection.get('selected_for_quantization', {})
++    if selection.get('split') != 'repair' or selection.get('worst_language') not in spec['languages'][family]:
++        raise ValueError('Selection must be fixed on the repair split with a target language')
++    if not selected or selected.get('steering') or selected.get('arm') == 'steer':
++        raise ValueError('NF4 requires the selected repair weight checkpoint, not a steering-only selection')
++    tag = safe_tag(selected.get('tag', ''))
++    if tag in ('global', family) or tag.endswith(('-nf4', '-q4')):
++        raise ValueError('Selected repair tag collides with a baseline or precision suffix')
++    if selected not in [arm.get('selected') for arm in selection.get('arms', {}).values()]:
++        raise ValueError('Selected quantization candidate is absent from repair selection evidence')
++    languages = set(spec['languages'][family])
++    prompts = [row for row in split_rows['heldout'] if row['lang'] in languages]
++    if not prompts:
++        raise ValueError('Source held-out prompts are missing for the selected family')
++    expected = {(row['id'], row['lang'], row['kind'], pre) for row in prompts for pre in ('default', 'none')}
++    for lang in languages:
++        for kind in ('harmful', 'benign'):
++            if not any(row['lang'] == lang and row['kind'] == kind for row in prompts):
++                raise ValueError(f'Source held-out prompts are missing {lang}/{kind}')
++    evidence = {'data/manifest.json', 'data/heldout.jsonl', 'data/repair.jsonl', 'selection.json'}
++    tags = ['global', family, tag]
++    capabilities = {}
++    rendered = None
++    for source_tag in tags:
++        generated = rows(source / 'gens' / f'{source_tag}.jsonl')
++        if any((row.get('variant') or {}).get('quant') not in (None, '') for row in generated):
++            raise ValueError(f'{source_tag}: source generation evidence is not full precision')
++        keys = [(row['id'], row['lang'], row['kind'], row['preamble']) for row in generated]
++        if len(keys) != len(expected) or set(keys) != expected:
++            raise ValueError(f'{source_tag}: source prompt set differs from complete heldout/both preambles')
++        if any(row.get('split') != 'heldout' for row in generated):
++            raise ValueError(f'{source_tag}: source prompt split is not heldout')
++        rendered_hashes = {(row['id'], row['preamble']): row.get('rendered_prompt_sha256') for row in generated}
++        if not all(rendered_hashes.values()) or (rendered is not None and rendered != rendered_hashes):
++            raise ValueError(f'{source_tag}: source rendered prompt hashes do not match baselines')
++        rendered = rendered_hashes
++        judged_name = f'{source_tag}.jsonl' if judge_set == 'router' else f'{source_tag}.local.jsonl'
++        judged_path = Path('judged') / judged_name
++        judged = rows(source / judged_path)
++        if {(row['id'], row['lang'], row['kind'], row['preamble']) for row in judged} != expected or len(judged) != len(expected):
++            raise ValueError(f'{source_tag}: source judged prompt set is incomplete')
++        summary = judged_path.with_suffix('.summary.json')
++        if len(read_json(source / summary).get('judges', [])) != 2:
++            raise ValueError(f'{source_tag}: source evidence requires two judges')
++        evidence.update((str(Path('gens') / f'{source_tag}.jsonl'), str(judged_path), str(summary)))
++        for pre in ('default', 'none'):
++            cap_path = capability_file(source_tag, pre)
++            cap = read_json(source / cap_path)
++            if cap.get('metadata', {}).get('quant') is not None or cap.get('metadata', {}).get('gguf'):
++                raise ValueError(f'{source_tag}: source FP16 capability precision is mismatched')
++            if not cap.get('complete'):
++                raise ValueError(f'{source_tag}/{pre}: source capability is incomplete')
++            cells = cap.get('languages', {})
++            langs = set(spec['capability_languages']) & languages
++            identity = {lang: {'n': cells.get(lang, {}).get('n'), 'data_sha256': cells.get(lang, {}).get('data_sha256')}
++                        for lang in sorted(langs)}
++            if any(not cell['n'] or not cell['data_sha256'] or len(cells[lang].get('per_item', [])) != cell['n']
++                   for lang, cell in identity.items()):
++                raise ValueError(f'{source_tag}/{pre}: source capability item evidence is missing')
++            if pre in capabilities and capabilities[pre] != identity:
++                raise ValueError(f'{source_tag}/{pre}: source capability inputs differ between checkpoints')
++            capabilities[pre] = identity
++            evidence.add(str(cap_path))
++    # Preserve available selected-arm/Q4 report evidence and real calibration; never copy GGUF weights.
++    all_tags = [*tags, *[safe_tag(arm['selected']['tag']) for arm in selection.get('arms', {}).values() if arm.get('selected')]]
++    for source_tag in dict.fromkeys(all_tags):
++        for variant in (source_tag, source_tag + '-q4'):
++            suffix = '' if judge_set == 'router' else '.local'
++            names = [Path('gens') / f'{variant}.jsonl', Path('judged') / f'{variant}{suffix}.jsonl',
++                     Path('judged') / f'{variant}{suffix}.summary.json',
++                     *(capability_file(variant, pre) for pre in ('default', 'none')),
++                     Path('calibration') / f'{variant}.{judge_set}.json',
++                     Path('calibration') / f'{variant}.router-comparison.json']
++            evidence.update(str(path) for path in names if (source / path).is_file())
++    identities = {name: {'sha256': sha256(source / name), 'bytes': (source / name).stat().st_size}
++                  for name in sorted(evidence)}
++    return selection, prompts, {'files': identities, 'tags': list(dict.fromkeys(all_tags)),
++                                'required_tags': tags,
++                                'capability': capabilities, 'rendered_prompts_sha256': digest(sorted(rendered.items()))}
++
++
++def build_plan(args) -> dict:
++    from langsafe.config import load_spec, spec_digest
++
++    source, output, spec_path = args.source_run.resolve(), args.output.resolve(), args.spec.resolve()
++    if source == output or source in output.parents or output in source.parents:
++        raise ValueError('Source and output directories overlap; use a separate CUDA artifact directory')
++    if output.exists() and (not output.is_dir() or any(output.iterdir())):
++        raise ValueError('NF4 output must be a new or empty directory; source artifacts are never overwritten')
++    spec = load_spec(spec_path)
++    if set(spec.get('preamble_conditions', [])) != {'default', 'none'} or len(spec['preamble_conditions']) != 2:
++        raise ValueError('NF4 comparison requires both default and none preamble conditions')
++    profile = spec.get('profile', 'full')
++    if profile != 'full' and not args.allow_development:
++        raise ValueError('Development inputs require --allow-development and remain development-only evidence')
++    if spec.get('decoding', {}).get('dtype') != 'float16' or spec['decoding'].get('do_sample') is not False:
++        raise ValueError('This NF4 workflow requires the experiment float16 compute dtype and deterministic decoding')
++    if profile == 'full' and spec.get('experiment', {}).get('capability_limit'):
++        raise ValueError('Full experiment cannot use a reduced capability_limit')
++    judges = spec.get('judging', {}).get('local_judges' if args.judges == 'local' else 'judges', [])
++    if len(judges) != 2 or len({(judge.get('base_url'), judge.get('model')) for judge in judges}) != 2:
++        raise ValueError('NF4 evaluation requires exactly two independent configured judges')
++    if args.judges == 'local' and any(judge.get('base_url') != 'local' or judge.get('quant', 'auto') not in ('auto', 'nf4')
++                                      or judge.get('dtype', 'float16') != 'float16' for judge in judges):
++        raise ValueError('Local CUDA judge precision must be automatic NF4 or explicit NF4 with float16 compute')
++    selection, prompts, source_identity = check_source(source, spec, args.family, args.judges)
++    selected = selection['selected_for_quantization']
++    selected_path = Path(selected['model']).expanduser()
++    # Relocate a copied source-run without rewriting its repair-only selection evidence.
++    if not selected_path.is_dir():
++        selected_path = source / 'checkpoints' / selected_path.name
++    if not selected_path.is_dir():
++        raise ValueError(f'Selected repair checkpoint missing; copy source checkpoints/{selected_path.name}')
++    # Keep baseline references portable in the CLI plan. On the CUDA host the
++    # same Hub IDs resolve through its offline cache/LANGSAFE_MODELS; only the
++    # selected repair checkpoint is copied into this isolated output.
++    model_refs = {'global': spec['models']['reference'], args.family: spec['models']['drifted'][args.family],
++                  selected['tag']: str(selected_path)}
++    models = dict(model_refs)
++    resolved, identities = {}, {}
++    for tag, model in models.items():
++        path, identity = checkpoint(model)
++        resolved[tag] = str(path); identities[tag] = identity
++    # Store a portable source-run path rather than the original machine's
++    # absolute checkpoint path; the source bundle is transferred as a unit.
++    selected_checkpoint_source = str((source / 'checkpoints' / selected_path.name).resolve())
++    resolved[selected['tag']] = selected_checkpoint_source
++    model_refs[selected['tag']] = selected_checkpoint_source
++    judge_models = {judge['name']: judge['model'] for judge in judges} if args.judges == 'local' else {}
++    source_identity['selected_checkpoint'] = {
++        'tag': selected['tag'], 'source': selected_checkpoint_source,
++        'files': identities[selected['tag']]['files'],
++        'bytes': identities[selected['tag']]['bytes'],
++    }
++    if args.judges == 'local':
++        for judge in judges:
++            _, identity = checkpoint(judge['model'])
++            identities['judge:' + judge['name']] = identity
++    stages = []
++    for tag in models:
++        nf4_tag = tag + '-nf4'
++        stages.append({'name': nf4_tag + '-heldout', 'args': ['generate', '--family', args.family,
++                       '--split', 'heldout', '--tag', nf4_tag, '--model', model_refs[tag], '--quant', 'nf4']})
++        for pre in spec['preamble_conditions']:
++            command = ['capability', '--family', args.family, '--tag', nf4_tag, '--model', model_refs[tag],
++                       '--quant', 'nf4', '--preamble', pre]
++            if spec.get('experiment', {}).get('capability_limit'):
++                command += ['--limit', str(spec['experiment']['capability_limit'])]
++            stages.append({'name': nf4_tag + '-capability-' + pre, 'args': command})
++        for command in ('judge', 'audit'):
++            stages.append({'name': nf4_tag + '-' + command, 'args': [command, '--tag', nf4_tag, '--judges', args.judges]})
++    report_tags = list(source_identity['required_tags'])
++    for tag in list(report_tags):
++        if str(Path('judged') / (tag + '-q4' + ('' if args.judges == 'router' else '.local') + '.jsonl')) in source_identity['files']:
++            report_tags.append(tag + '-q4')
++    report_tags += [tag + '-nf4' for tag in models]
++    stages.append({'name': 'report', 'args': ['report', '--tags', ','.join(report_tags), '--family', args.family, '--judges', args.judges]})
++    stages.append({'name': 'ledger-verify', 'args': ['ledger-verify']})
++    return {'schema_version': 1, 'status': 'planned_not_executed', 'precision': 'nf4', 'compute_dtype': 'float16',
++            'profile': profile, 'family': args.family, 'judge_set': args.judges, 'hardware_checked': False,
++            'source_run': str(source), 'output': str(output), 'spec': str(spec_path), 'spec_digest': spec_digest(spec),
++            'spec_sha256': sha256(spec_path), 'source_evidence': source_identity, 'model_refs': model_refs,
++            'resolved_models': resolved,
++            'selected_checkpoint_source': selected_checkpoint_source,
++            'selected_checkpoint_target': str(output / 'checkpoints' / selected['tag']),
++            'checkpoints': identities, 'software': software(), 'code': code_identity(),
++            'judge_models': judge_models,
++            'heldout_prompts': len(prompts), 'heldout_evaluations_per_model': len(prompts) * 2,
++            'preamble_conditions': spec['preamble_conditions'], 'report_tags': report_tags, 'stages': stages,
++            'network': 'offline model/data; router requests only with explicit --judges router --allow-router',
++            'copy_bytes': (sum(file['bytes'] for file in source_identity['files'].values())
++                           + identities[selected['tag']]['bytes'] + spec_path.stat().st_size)}
++
++
++def check_runtime(plan: dict, min_free_gib: float) -> dict:
++    """Called only by explicit remote --check-hardware/--execute, never --dry-run."""
++    if platform.system() != 'Linux':
++        raise ValueError('Genuine Linux CUDA hardware is required; NF4 is not executed on this Mac')
++    remote_software = software()
++    remote_code = code_identity()
++    if remote_code.get('content_sha256') != plan.get('code', {}).get('content_sha256'):
++        raise ValueError('Remote code hash differs from the offline plan; transfer the exact working tree')
++    missing = [name for name, version in remote_software.items()
++               if name in {'torch', 'transformers', 'accelerate', 'bitsandbytes', 'datasets', 'auditkit', 'huggingface_hub'} and not version]
++    if missing:
++        raise ValueError('Missing runtime packages: ' + ', '.join(missing))
++    for tag, model in plan['model_refs'].items():
++        path, identity = checkpoint(model)
++        expected = plan['checkpoints'][tag]
++        if checkpoint_content(identity) != checkpoint_content(expected):
++            raise ValueError(f'Checkpoint content differs from the offline plan for {tag}: {path}')
++    for name, model in plan.get('judge_models', {}).items():
++        path, identity = checkpoint(model)
++        expected = plan['checkpoints']['judge:' + name]
++        if checkpoint_content(identity) != checkpoint_content(expected):
++            raise ValueError(f'Judge checkpoint content differs from the offline plan for {name}: {path}')
++    import torch
++    import bitsandbytes as bnb
++    from bitsandbytes.cextension import lib
++
++    if not torch.version.cuda or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
++        raise ValueError('Expose exactly one genuine CUDA device (CUDA_VISIBLE_DEVICES=0); no CPU/MPS fallback')
++    if not getattr(lib, 'compiled_with_cuda', False):
++        raise ValueError('bitsandbytes CUDA native library is unavailable')
++    props = torch.cuda.get_device_properties(0)
++    free, total = torch.cuda.mem_get_info(0)
++    if props.major < 7 or total < 12 * GIB or free < 8 * GIB:
++        raise ValueError('CUDA preflight requires compute capability >=7.0, >=12 GiB VRAM and >=8 GiB free; prefer 24 GiB')
++    # Exercise actual NF4 quantization/dequantization and a CUDA kernel without loading a checkpoint.
++    test = torch.arange(128, device='cuda', dtype=torch.float16).reshape(2, 64) / 128
++    packed, state = bnb.functional.quantize_4bit(test, blocksize=64, quant_type='nf4')
++    restored = bnb.functional.dequantize_4bit(packed, state)
++    if restored.device.type != 'cuda' or not torch.isfinite(restored).all().item():
++        raise ValueError('bitsandbytes NF4 CUDA smoke check failed')
++    torch.cuda.synchronize()
++    del test, packed, state, restored
++    torch.cuda.empty_cache()
++    parent = Path(plan['output'])
++    while not parent.exists():
++        parent = parent.parent
++    available = shutil.disk_usage(parent).free
++    required = plan['copy_bytes'] + max(min_free_gib, 2) * GIB
++    if available < required:
++        raise ValueError(f'Insufficient output storage: {available / GIB:.1f} GiB free; {required / GIB:.1f} GiB required')
++    from langsafe.eval.capability import load_items
++    from langsafe.config import load_spec
++    spec = load_spec(plan['spec'])
++    capabilities = {}
++    for lang, expected in plan['source_evidence']['capability']['default'].items():
++        items = load_items(lang, spec.get('experiment', {}).get('capability_limit'))
++        actual = {'n': len(items), 'data_sha256': digest(items)}
++        if actual != expected or actual != plan['source_evidence']['capability']['none'][lang]:
++            raise ValueError(f'Cached capability inputs differ from source experiment: {lang}; copy the same HF dataset cache')
++        capabilities[lang] = actual
++    import auditkit
++    if not all(hasattr(auditkit, name) for name in ('Sample', 'RunConfig', 'evaluate', 'scorer')):
++        raise ValueError('AuditKIT runtime lacks the APIs required by the existing audit bridge')
++    query = subprocess.run(['nvidia-smi', '--query-gpu=name,uuid,driver_version,memory.total', '--format=csv,noheader'],
++                           capture_output=True, text=True, check=False) if shutil.which('nvidia-smi') else None
++    return {'device': props.name, 'compute_capability': [props.major, props.minor], 'vram_bytes': total,
++            'free_vram_bytes': free, 'cuda_runtime': torch.version.cuda, 'cudnn': torch.backends.cudnn.version(),
++            'nvidia_smi': query.stdout.strip() if query and query.returncode == 0 else None,
++            'bitsandbytes_nf4_kernel': 'passed', 'capability_inputs': capabilities,
++            'output_free_bytes': available, 'output_required_bytes': required,
++            'software': remote_software, 'code': remote_code}
++
++
++def validate_nf4_outputs(plan: dict) -> None:
++    """Verify actual output identity/coverage before software_run_complete may be written."""
++    output = Path(plan['output'])
++    source = Path(plan['source_run'])
++    selected = read_json(source / 'selection.json')['selected_for_quantization']['tag']
++    expected_keys = None
++    for tag in ('global', plan['family'], selected):
++        baseline = rows(source / 'gens' / f'{tag}.jsonl')
++        expected = {(row['id'], row['lang'], row['kind'], row['preamble']): row['rendered_prompt_sha256'] for row in baseline}
++        generated = rows(output / 'gens' / f'{tag}-nf4.jsonl')
++        actual = {(row['id'], row['lang'], row['kind'], row['preamble']): row.get('rendered_prompt_sha256') for row in generated}
++        if actual != expected or len(generated) != len(expected):
++            raise ValueError(f'{tag}-nf4: prompt set/rendering differs from source baseline')
++        if any(row.get('model_tag') != tag + '-nf4' or row.get('split') != 'heldout' for row in generated):
++            raise ValueError(f'{tag}-nf4: generation identity differs from NF4 heldout run')
++        for pre in plan['preamble_conditions']:
++            cap = read_json(output / capability_file(tag + '-nf4', pre))
++            if not cap.get('complete') or cap.get('metadata', {}).get('quant') != 'nf4':
++                raise ValueError(f'{tag}-nf4/{pre}: capability precision/completion missing')
++            for lang, expected_cell in plan['source_evidence']['capability'][pre].items():
++                cell = cap.get('languages', {}).get(lang, {})
++                if any(cell.get(key) != value for key, value in expected_cell.items()):
++                    raise ValueError(f'{tag}-nf4/{pre}: capability inputs changed for {lang}')
++        judged_name = f'{tag}-nf4' + ('' if plan['judge_set'] == 'router' else '.local')
++        judged = rows(output / 'judged' / (judged_name + '.jsonl'))
++        keys = [(row['id'], row['lang'], row['kind'], row['preamble']) for row in judged]
++        if set(keys) != set(expected) or len(keys) != len(expected):
++            raise ValueError(f'{tag}-nf4: incomplete judged prompt coverage')
++        if len(read_json(output / 'judged' / (judged_name + '.summary.json')).get('judges', [])) != 2:
++            raise ValueError(f'{tag}-nf4: two-judge evidence missing')
++        variant = f'{tag}-nf4.{plan["judge_set"]}'
++        read_json(output / 'auditkit' / variant / (variant + '.json'))
++    report = read_json(output / 'report.json')
++    if not set(plan['report_tags']) <= set(report.get('models', {})):
++        raise ValueError('Report omitted requested NF4/source tags')
++    comparisons = report.get('thresholds', {})
++    for pre in plan['preamble_conditions']:
++        if f'{selected}-nf4/{pre}' not in comparisons:
++            raise ValueError('Report omitted same-precision NF4 repair comparison')
++
++
++def execute(plan: dict, hardware: dict) -> None:
++    from langsafe.experiment import atomic_json
++
++    output, source = Path(plan['output']), Path(plan['source_run'])
++    if output.exists() and any(output.iterdir()):
++        raise ValueError('NF4 output became occupied after preflight; refusing to overwrite it')
++    output.mkdir(parents=True, exist_ok=True)
++    metadata = {**plan, 'status': 'running', 'hardware_checked': True, 'hardware': hardware,
++                'software': hardware.get('software', plan.get('software')),
++                'remote_code': hardware.get('code'),
++                'started_at': datetime.now(timezone.utc).isoformat(), 'software_run_complete': False,
++                'nf4_cuda': 'not_complete'}
++    atomic_json(output / 'nf4-environment.json', metadata)
++    try:
++        selected_source = Path(plan['selected_checkpoint_source'])
++        selected_target = Path(plan['selected_checkpoint_target'])
++        if not selected_source.is_dir():
++            raise ValueError(f'Selected repair checkpoint disappeared before execution: {selected_source}')
++        selected_identity = plan['source_evidence']['selected_checkpoint']['files']
++        for relative, identity in selected_identity.items():
++            path = selected_source / relative
++            if not path.is_file() or sha256(path) != identity['sha256']:
++                raise ValueError(f'Selected repair checkpoint changed since preflight: {relative}')
++        selected_target.parent.mkdir(parents=True, exist_ok=True)
++        shutil.copytree(selected_source, selected_target, dirs_exist_ok=False)
++        for name, identity in plan['source_evidence']['files'].items():
++            if sha256(source / name) != identity['sha256']:
++                raise ValueError(f'Source changed since preflight: {name}')
++            destination = output / name
++            destination.parent.mkdir(parents=True, exist_ok=True)
++            shutil.copy2(source / name, destination)
++        shutil.copy2(plan['spec'], output / 'source-spec.yaml')
++        env = dict(os.environ, LANGSAFE_DEVICE='cuda', LANGSAFE_RUNS_DIR=str(output),
++                   LANGSAFE_DATA_DIR=str(output / 'data'), LANGSAFE_SPEC=str(output / 'source-spec.yaml'),
++                   HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1', TOKENIZERS_PARALLELISM='false')
++        for stage in plan['stages']:
++            print(f'[NF4] {stage["name"]}', flush=True)
++            atomic_json(output / 'current-stage.json', {'stage': stage['name'], 'status': 'running'})
++            log = output / 'logs' / (stage['name'] + '.log')
++            log.parent.mkdir(exist_ok=True)
++            command = [sys.executable, '-u', '-m', 'langsafe.cli', '--spec', str(output / 'source-spec.yaml'),
++                       '--runs-dir', str(output), *stage['args']]
++            command = [str(selected_target) if value == plan['selected_checkpoint_source'] else value
++                       for value in command]
++            with log.open('w', encoding='utf-8') as stream:
++                subprocess.run(command, cwd=ROOT, env=env, stdout=stream, stderr=subprocess.STDOUT, check=True)
++            atomic_json(output / 'current-stage.json', {'stage': stage['name'], 'status': 'complete'})
++        validate_nf4_outputs(plan)
++        metadata.update(status='complete', software_run_complete=True, nf4_cuda='executed',
++                        finished_at=datetime.now(timezone.utc).isoformat())
++        metadata['artifacts_sha256'] = {str(path.relative_to(output)): sha256(path) for path in sorted(output.rglob('*'))
++                                       if path.is_file() and path.name not in ('nf4-environment.json', 'nf4-status.json')}
++        report = read_json(output / 'report.json')
++        atomic_json(output / 'nf4-status.json', {'software_run_complete': True, 'nf4_cuda': 'executed',
++                    'profile': plan['profile'], 'family': plan['family'], 'precision': 'nf4',
++                    'empirical_repair_success': report['empirical_repair_success'],
++                    'validation_gaps': report['validation_gaps'], 'report': str(output / 'report.md')})
++    except BaseException as error:
++        metadata.update(status='failed', failure_type=type(error).__name__, nf4_cuda='not_complete')
++        atomic_json(output / 'current-stage.json', {'stage': locals().get('stage', {}).get('name'), 'status': 'failed'})
++        raise
++    finally:
++        atomic_json(output / 'nf4-environment.json', metadata)
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--source-run', type=Path, required=True, help='Completed source experiment/evidence bundle')
++    parser.add_argument('--spec', type=Path, required=True, help='Exact same source spec')
++    parser.add_argument('--output', type=Path, required=True, help='New isolated CUDA/NF4 artifact directory')
++    parser.add_argument('--family', choices=('fire', 'earth'), default='fire')
++    parser.add_argument('--judges', choices=('local', 'router'), default='local')
++    parser.add_argument('--allow-router', action='store_true', help='Explicitly authorize configured billed router requests during execution')
++    parser.add_argument('--allow-development', action='store_true', help='Permit clearly marked development-only evidence')
++    parser.add_argument('--min-free-gib', type=float, default=10, help='Output headroom in addition to copied evidence (default 10 GiB)')
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument('--dry-run', action='store_true', help='Hash inputs/print plan only; never load torch or touch GPU/network')
++    mode.add_argument('--check-hardware', action='store_true', help='On CUDA host: check NF4 kernel, storage, offline capability cache; no checkpoint loads')
++    mode.add_argument('--execute', action='store_true', help='On authorized CUDA host: preflight then run all stages serially')
++    args = parser.parse_args(argv)
++    # Model and dataset code cannot silently download replacements during the handoff.
++    os.environ.update(HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1', LANGSAFE_DEVICE='cuda')
++    try:
++        if args.min_free_gib < 0:
++            raise ValueError('--min-free-gib must be nonnegative')
++        if args.execute and args.judges == 'router' and not args.allow_router:
++            raise ValueError('Router execution requires explicit --allow-router authorization and HF_TOKEN')
++        if args.execute and args.judges == 'router' and not os.environ.get('HF_TOKEN'):
++            raise ValueError('Router execution requires HF_TOKEN; its value is never logged')
++        plan = build_plan(args)
++        if args.dry_run:
++            print(json.dumps(plan, indent=2, ensure_ascii=False))
++            return 0
++        hardware = check_runtime(plan, args.min_free_gib)
++        if args.check_hardware:
++            print(json.dumps({**plan, 'status': 'preflight_passed_not_executed', 'hardware_checked': True, 'hardware': hardware}, indent=2))
++        else:
++            execute(plan, hardware)
++        return 0
++    except (ValueError, OSError, ImportError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
++        # Never log exception payloads from remote APIs or credentials.
++        if isinstance(error, subprocess.CalledProcessError):
++            print('NF4 blocked: stage failed; inspect isolated output logs and current-stage.json', file=sys.stderr)
++        else:
++            print(f'NF4 blocked: {error}', file=sys.stderr)
++        return 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/scripts/run_nf4_evaluation.sh b/scripts/run_nf4_evaluation.sh
+new file mode 100755
+index 0000000..d55bade
+--- /dev/null
++++ b/scripts/run_nf4_evaluation.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++# Portable CUDA entry point. Planning is always explicit; execution needs --execute.
++set -euo pipefail
++TASK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$TASK_ROOT"
++TASK_PYTHON="${LANGSAFE_PYTHON:-$TASK_ROOT/.venv/bin/python}"
++if [[ ! -x "$TASK_PYTHON" ]]; then
++  printf '%s\n' 'Set LANGSAFE_PYTHON to the prepared Python 3.12+ environment; this runner never installs dependencies.' >&2
++  exit 1
++fi
++exec "$TASK_PYTHON" -u "$TASK_ROOT/scripts/check_nf4_environment.py" "$@"
+diff --git a/tests/test_nf4_workflow.py b/tests/test_nf4_workflow.py
+new file mode 100644
+index 0000000..0b97151
+--- /dev/null
++++ b/tests/test_nf4_workflow.py
+@@ -0,0 +1,281 @@
++"""Offline contracts for the CUDA handoff; no model, GPU, or network is used."""
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++import yaml
++
++ROOT = Path(__file__).resolve().parents[1]
++SCRIPT = ROOT / 'scripts' / 'check_nf4_environment.py'
++
++
++def _digest(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
++
++
++def _write_rows(path, rows):
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
++
++
++@pytest.fixture
++def handoff(tmp_path):
++    source = tmp_path / 'source'
++    models = tmp_path / 'models'
++    for name in ('global', 'fire'):
++        checkpoint = models / name
++        checkpoint.mkdir(parents=True)
++        (checkpoint / 'config.json').write_text('{"model_type":"cohere2"}')
++        (checkpoint / 'model.safetensors').write_bytes(b'fixture weights, never loaded')
++        (checkpoint / 'tokenizer.json').write_text('{}')
++        (checkpoint / 'tokenizer_config.json').write_text('{}')
++    checkpoint = source / 'checkpoints' / 'fire-resta-a0.1'
++    checkpoint.mkdir(parents=True)
++    for name in ('config.json', 'model.safetensors', 'tokenizer.json', 'tokenizer_config.json'):
++        (checkpoint / name).write_bytes((models / 'fire' / name).read_bytes())
++    spec = {
++        'spec_version': 1, 'frozen': False,
++        'models': {'reference': 'Fixture/global', 'drifted': {'fire': 'Fixture/fire'}},
++        'languages': {'fire': ['en']}, 'capability_languages': ['en'],
++        'preamble_conditions': ['default', 'none'],
++        'decoding': {'dtype': 'float16', 'do_sample': False, 'max_new_tokens': 256, 'batch_size': 2},
++        'data': {'seed': 1}, 'experiment': {'local_batch_size': 2},
++        'judging': {'local_judges': [
++            {'name': 'first', 'model': 'Fixture/global', 'base_url': 'local'},
++            {'name': 'second', 'model': 'Fixture/fire', 'base_url': 'local'}]},
++        'quantization': ['nf4', 'gguf_q4_k_m'], 'thresholds': {'quantized_must_hold': True},
++    }
++    spec_path = tmp_path / 'spec.yaml'
++    spec_path.write_text(yaml.safe_dump(spec))
++    data = source / 'data'
++    heldout = [dict(id=f'heldout-{kind}::en', group=f'heldout-{kind}', lang='en', kind=kind,
++                    text=f'{kind} held-out fixture', source='fixture', source_id=kind, split='heldout')
++               for kind in ('harmful', 'benign')]
++    repair = [dict(row, id=row['id'].replace('heldout', 'repair'),
++                   group=row['group'].replace('heldout', 'repair'), split='repair') for row in heldout]
++    _write_rows(data / 'heldout.jsonl', heldout)
++    _write_rows(data / 'repair.jsonl', repair)
++    manifest = {'spec_digest': _digest(spec), 'family': 'fire', 'languages': ['en'],
++                'coverage': {'complete': True}, 'leakage_check': {'ok': True},
++                'files': {split: {'sha256': hashlib.sha256((data / f'{split}.jsonl').read_bytes()).hexdigest(),
++                                 'rows': 2} for split in ('heldout', 'repair')}}
++    (data / 'manifest.json').write_text(json.dumps(manifest))
++    selected = {'tag': 'fire-resta-0p1', 'arm': 'resta', 'knob': 0.1,
++                'model': '/original-machine/run/checkpoints/fire-resta-a0.1'}
++    selection = {'split': 'repair', 'preamble': 'default', 'worst_language': 'en',
++                 'arms': {'resta': {'selected': selected}}, 'selected_for_quantization': selected}
++    (source / 'selection.json').write_text(json.dumps(selection))
++    for tag in ('global', 'fire', 'fire-resta-0p1'):
++        gens = [dict(row, preamble=pre, model_tag=tag, fingerprint=tag, response='fixture',
++                     rendered_prompt_sha256=f"{row['id']}-{pre}") for row in heldout for pre in ('default', 'none')]
++        _write_rows(source / 'gens' / f'{tag}.jsonl', gens)
++        _write_rows(source / 'judged' / f'{tag}.local.jsonl', [dict(row, label='unclear') for row in gens])
++        (source / 'judged' / f'{tag}.local.summary.json').write_text(json.dumps({'judges': ['first', 'second']}))
++        for pre in ('default', 'none'):
++            suffix = '' if pre == 'default' else '.none'
++            path = source / 'capability' / f'{tag}{suffix}.json'
++            path.parent.mkdir(exist_ok=True)
++            path.write_text(json.dumps({'complete': True, 'metadata': {'quant': None, 'preamble': pre},
++                                       'languages': {'en': {'data_sha256': 'same-items', 'n': 2, 'per_item': [1, 0]}}}))
++    return {'source': source, 'models': models, 'spec': spec_path, 'output': tmp_path / 'remote-nf4'}
++
++
++def run_handoff(handoff, *args):
++    env = dict(os.environ, LANGSAFE_MODELS=str(handoff['models']), HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1')
++    return subprocess.run([sys.executable, str(SCRIPT), '--source-run', str(handoff['source']),
++                           '--spec', str(handoff['spec']), '--output', str(handoff['output']), *args],
++                          cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
++
++
++def test_offline_plan_preserves_full_prompts_and_precision_matched_trio(handoff):
++    result = run_handoff(handoff, '--dry-run')
++    assert result.returncode == 0, result.stderr
++    plan = json.loads(result.stdout)
++    assert plan['status'] == 'planned_not_executed'
++    assert plan['profile'] == 'full'
++    assert plan['hardware_checked'] is False
++    commands = [stage['args'] for stage in plan['stages']]
++    generations = [args for args in commands if args[0] == 'generate']
++    assert [args[args.index('--tag') + 1] for args in generations] == ['global-nf4', 'fire-nf4', 'fire-resta-0p1-nf4']
++    assert all(args[args.index('--quant') + 1] == 'nf4' and '--limit' not in args and '--preamble' not in args
++               for args in generations)
++    capabilities = [args for args in commands if args[0] == 'capability']
++    assert len(capabilities) == 6
++    assert {args[args.index('--preamble') + 1] for args in capabilities} == {'default', 'none'}
++    assert all('--quant' in args and '--limit' not in args for args in capabilities)
++    assert len([args for args in commands if args[0] == 'judge' and '--judges' in args]) == 3
++    assert len([args for args in commands if args[0] == 'audit']) == 3
++    report = next(args for args in commands if args[0] == 'report')
++    assert report[report.index('--tags') + 1] == 'global,fire,fire-resta-0p1,global-nf4,fire-nf4,fire-resta-0p1-nf4'
++    assert not handoff['output'].exists()
++    assert plan['resolved_models']['fire-resta-0p1'] == str(handoff['source'] / 'checkpoints' / 'fire-resta-a0.1')
++    assert plan['model_refs']['global'] == 'Fixture/global'
++    assert plan['source_evidence']['selected_checkpoint']['tag'] == 'fire-resta-0p1'
++    assert plan['source_evidence']['selected_checkpoint']['files']
++    selected_generation = next(args for args in generations if args[args.index('--tag') + 1] == 'fire-resta-0p1-nf4')
++    assert selected_generation[selected_generation.index('--model') + 1] == str(handoff['source'] / 'checkpoints' / 'fire-resta-a0.1')
++    assert plan['code']['content_sha256'] and plan['source_evidence']['files']
++    assert plan['selected_checkpoint_target'].endswith('/checkpoints/fire-resta-0p1')
++
++
++@pytest.mark.parametrize('mutation,expected', [
++    ('data', 'hash'), ('spec', 'spec'), ('selection', 'repair'), ('preambles', 'preamble'),
++    ('precision', 'precision'), ('prompts', 'prompt'), ('occupied', 'empty'), ('nested', 'overlap')])
++def test_handoff_fails_closed_before_gpu_work(handoff, mutation, expected):
++    if mutation == 'data':
++        with (handoff['source'] / 'data' / 'heldout.jsonl').open('a') as stream:
++            stream.write('\n')
++    elif mutation in {'spec', 'preambles'}:
++        spec = yaml.safe_load(handoff['spec'].read_text())
++        if mutation == 'spec':
++            spec['data']['seed'] = 9
++        else:
++            spec['preamble_conditions'] = ['default']
++        handoff['spec'].write_text(yaml.safe_dump(spec))
++    elif mutation == 'selection':
++        path = handoff['source'] / 'selection.json'
++        value = json.loads(path.read_text()); value['split'] = 'heldout'; path.write_text(json.dumps(value))
++    elif mutation == 'precision':
++        path = handoff['source'] / 'capability' / 'global.json'
++        value = json.loads(path.read_text()); value['metadata']['quant'] = 'nf4'; path.write_text(json.dumps(value))
++    elif mutation == 'prompts':
++        path = handoff['source'] / 'gens' / 'fire.jsonl'
++        path.write_text(path.read_text().splitlines()[0] + '\n')
++    elif mutation == 'occupied':
++        handoff['output'].mkdir(); (handoff['output'] / 'unrelated').write_text('keep me')
++    elif mutation == 'nested':
++        handoff['output'] = handoff['source'] / 'nf4'
++    result = run_handoff(handoff, '--dry-run')
++    assert result.returncode != 0
++    assert expected in result.stderr.lower()
++    assert not (handoff['output'] / 'gens').exists()
++
++
++def test_source_generation_quantization_metadata_cannot_be_mixed(handoff):
++    path = handoff['source'] / 'gens' / 'global.jsonl'
++    value = json.loads(path.read_text().splitlines()[0]); value['variant'] = {'quant': 'nf4'}
++    path.write_text(json.dumps(value) + '\n' + '\n'.join(path.read_text().splitlines()[1:]) + '\n')
++    result = run_handoff(handoff, '--dry-run')
++    assert result.returncode != 0 and 'full precision' in result.stderr.lower()
++
++
++def test_development_inputs_require_explicit_label(handoff):
++    spec = yaml.safe_load(handoff['spec'].read_text()); spec['profile'] = 'development'
++    handoff['spec'].write_text(yaml.safe_dump(spec))
++    path = handoff['source'] / 'data' / 'manifest.json'
++    manifest = json.loads(path.read_text()); manifest['spec_digest'] = _digest(spec); path.write_text(json.dumps(manifest))
++    denied = run_handoff(handoff, '--dry-run')
++    assert denied.returncode != 0 and 'development' in denied.stderr.lower()
++    allowed = run_handoff(handoff, '--dry-run', '--allow-development')
++    assert allowed.returncode == 0, allowed.stderr
++    assert json.loads(allowed.stdout)['profile'] == 'development'
++
++
++def test_missing_cached_checkpoint_is_an_explicit_offline_blocker(handoff):
++    (handoff['models'] / 'global' / 'model.safetensors').unlink()
++    result = run_handoff(handoff, '--dry-run')
++    assert result.returncode != 0
++    assert 'checkpoint' in result.stderr.lower()
++
++
++def test_nf4_model_validation_rejects_cpu_or_disk_offload():
++    from langsafe.gen.model import validate_nf4_model
++
++    class Offloaded:
++        is_loaded_in_4bit = True
++        hf_device_map = {'': 'cuda', 'lm_head': 'cpu'}
++
++    with pytest.raises(RuntimeError, match='CUDA'):
++        validate_nf4_model(Offloaded())
++
++
++def test_nf4_validation_rejects_unquantized_or_unplaced_models():
++    from types import SimpleNamespace
++    from langsafe.gen.model import validate_nf4_model
++
++    with pytest.raises(RuntimeError, match='4-bit'):
++        validate_nf4_model(SimpleNamespace(is_loaded_in_4bit=False, hf_device_map={'': 'cuda'}))
++    with pytest.raises(RuntimeError, match='CUDA'):
++        validate_nf4_model(SimpleNamespace(is_loaded_in_4bit=True, hf_device_map={'lm_head': 'cpu'}))
++    with pytest.raises(RuntimeError, match='device map'):
++        validate_nf4_model(SimpleNamespace(is_loaded_in_4bit=True, hf_device_map=None))
++    quantizer = SimpleNamespace(quantization_config=SimpleNamespace(_load_in_4bit=True, bnb_4bit_quant_type='nf4'))
++    validate_nf4_model(SimpleNamespace(hf_quantizer=quantizer, hf_device_map={'': 0}))
++    with pytest.raises(RuntimeError, match='quantizer type'):
++        validate_nf4_model(SimpleNamespace(is_loaded_in_4bit=True,
++                                           hf_quantizer=SimpleNamespace(quantization_config=SimpleNamespace(
++                                               _load_in_4bit=True, bnb_4bit_quant_type='fp4')),
++                                           hf_device_map={'': 0}))
++
++
++def test_nf4_load_requires_cuda_before_tokenizer_or_checkpoint_loading(monkeypatch):
++    from types import SimpleNamespace
++    from langsafe.gen import model
++
++    def forbidden(*args, **kwargs):
++        pytest.fail('A CUDA preflight failure must precede all checkpoint/tokenizer loading')
++
++    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
++    monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
++        AutoModelForCausalLM=SimpleNamespace(from_pretrained=forbidden),
++        AutoTokenizer=SimpleNamespace(from_pretrained=forbidden)))
++    monkeypatch.setenv('LANGSAFE_DEVICE', 'cuda')
++    with pytest.raises(RuntimeError, match='CUDA'):
++        model.load('must-not-load', quant='nf4')
++
++
++def test_nf4_cuda_map_and_quantization_settings_are_explicit(monkeypatch):
++    from types import SimpleNamespace
++    from langsafe.gen import model
++
++    loaded = SimpleNamespace(is_loaded_in_4bit=True, hf_device_map={'': 'cuda:0'},
++                             named_parameters=lambda: iter([('weight', SimpleNamespace(device=SimpleNamespace(type='cuda')))]),
++                             eval=lambda: None)
++    capture = {}
++    def from_pretrained(path, **kwargs):
++        capture.update(kwargs)
++        return loaded
++    monkeypatch.setitem(sys.modules, 'torch', SimpleNamespace(
++        float16='fake-fp16', cuda=SimpleNamespace(is_available=lambda: True)))
++    monkeypatch.setitem(sys.modules, 'transformers', SimpleNamespace(
++        AutoModelForCausalLM=SimpleNamespace(from_pretrained=from_pretrained),
++        AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args: 'fake-tokenizer'),
++        BitsAndBytesConfig=lambda **kwargs: kwargs))
++    monkeypatch.setenv('LANGSAFE_DEVICE', 'cuda')
++    actual, tokenizer = model.load('offline-fixture', quant='nf4')
++    assert actual is loaded and tokenizer == 'fake-tokenizer'
++    assert capture['device_map'] == {'': 0}
++    assert capture['quantization_config'] == {
++        'load_in_4bit': True, 'bnb_4bit_quant_type': 'nf4', 'bnb_4bit_compute_dtype': 'fake-fp16',
++        'bnb_4bit_use_double_quant': False}
++    with pytest.raises(RuntimeError, match='strict single-CUDA'):
++        model.load('offline-fixture', quant='nf4', device_map='auto')
++
++
++def test_plan_commands_are_accepted_by_existing_cli(handoff, monkeypatch):
++    from langsafe import cli
++
++    result = run_handoff(handoff, '--dry-run')
++    assert result.returncode == 0, result.stderr
++    plan = json.loads(result.stdout)
++    called = []
++    for name in ('generate', 'capability', 'judge', 'audit', 'report', 'ledger_verify'):
++        monkeypatch.setattr(cli, 'cmd_' + name, lambda args: called.append(args))
++    monkeypatch.setenv('LANGSAFE_SPEC', str(handoff['spec']))
++    for stage in plan['stages']:
++        cli.main(['--spec', str(handoff['spec']), *stage['args']])
++    assert len(called) == len(plan['stages'])
++
++
++def test_router_execution_requires_explicit_network_authorization_before_work(handoff):
++    result = run_handoff(handoff, '--execute', '--judges', 'router')
++    assert result.returncode != 0
++    assert '--allow-router' in result.stderr
++    assert not handoff['output'].exists()
+diff --git a/docs/CUDA_EVALUATION.md b/docs/CUDA_EVALUATION.md
+new file mode 100644
+index 0000000..9807771
+--- /dev/null
++++ b/docs/CUDA_EVALUATION.md
+@@ -0,0 +1,165 @@
++# Portable CUDA/NF4 evaluation
++
++NF4 is an in-process `bitsandbytes` format. It requires a Linux CUDA host and
++the same float16 experiment inputs used by the source run. The Mac workflow
++does not execute NF4: `scripts/run_nf4_evaluation.sh --dry-run` only validates
++the handoff and prints a plan.
++
++The handoff is deliberately isolated. Point `--source-run` at a completed
++experiment directory and `--output` at a new directory on the CUDA machine.
++The source run must contain its manifest, repair/held-out JSONL files,
++`selection.json`, Global/Fire/selected-repair generations, two-judge judgments,
++AuditKIT records, and both capability conditions. The planner hashes these
++files, the source spec, all checkpoint files, and the code/runtime identity.
++It rejects mismatched specs or data hashes, overlapping repair/held-out groups,
++incomplete judge/capability coverage, steering-only selections, and an output
++directory that is occupied or overlaps the source. It never copies or evaluates
++GGUF files as NF4.
++
++## Offline plan on the source machine
++
++```bash
++LANGSAFE_PYTHON=.venv/bin/python bash scripts/run_nf4_evaluation.sh \
++  --source-run runs/experiments/full/fire \
++  --spec configs/spec.yaml \
++  --output /mnt/lexsi/nf4-fire \
++  --family fire --judges local --dry-run > nf4-plan.json
++```
++
++The plan must say `status: planned_not_executed`, `precision: nf4`, and
++`hardware_checked: false`. It lists exactly three NF4 model tags:
++`global-nf4`, `fire-nf4`, and the repair tag recorded in
++`selection.json` with `-nf4` appended. Every tag is generated on the complete
++held-out prompt set; capability is run with both `default` and `none`
++preambles. Each tag then receives the configured two judges, AuditKIT, and a
++report containing same-precision Global/Fire/repair comparisons. No `--limit`
++is added to a full-profile plan. Development specs are refused unless
++`--allow-development` is supplied and remain development-only evidence.
++
++The plan is a portable contract. Copy it and the source checkpoint/evidence
++bundle to the CUDA host through the project's approved transfer mechanism. Do
++not copy harmful raw generations to a public location. On the remote host,
++provision the exact Python environment, model snapshots, and dataset cache
++offline; the runner never installs packages or silently downloads replacements.
++
++The repository's current local source tree is intentionally uncommitted. The
++handoff therefore includes the source commit (when one exists) plus the
++`code.files_sha256` map in `nf4-plan.json`; copy the exact working tree or an
++archive made from that map rather than checking out an unrelated branch. Keep
++the source `data/manifest.json`, `selection.json`, both split JSONL files, and
++the selected `checkpoints/<tag>/` directory together. The planner's
++`source_evidence.files` plus `source_evidence.selected_checkpoint.files` maps
++are the transfer manifest. They record every copied path, byte count, and
++SHA-256; validate them after transfer before running
++preflight. Do not add generated generations, judged responses, tokens, or
++checkpoint files to a public commit.
++
++Before transfer, preserve the working-tree record alongside the private bundle:
++
++```bash
++git status --short > /mnt/lexsi/source-git-status.txt
++git diff --binary -- src configs scripts docs pyproject.toml > /mnt/lexsi/source-working-tree.diff
++```
++
++The diff is a review aid for the intentional local edits; the runner itself
++uses the code/spec/data/checkpoint SHA-256 maps as the execution identity.
++Keep that diff private because the source tree and generated evidence may
++contain experiment details that are not for publication.
++
++## CUDA preflight
++
++On Linux, run:
++
++```bash
++LANGSAFE_PYTHON=.venv/bin/python bash scripts/run_nf4_evaluation.sh \
++  --source-run /mnt/lexsi/full-fire \
++  --spec /mnt/lexsi/full-fire/source-spec.yaml \
++  --output /mnt/lexsi/nf4-fire \
++  --family fire --judges local --check-hardware
++```
++
++Preflight requires one visible CUDA device, compute capability 7.0 or newer,
++at least 12 GiB total and 8 GiB free VRAM, a CUDA-enabled `bitsandbytes`, and
++enough output storage. It performs a tiny NF4 quantize/dequantize CUDA kernel
++smoke test and verifies that cached Global-MMLU-Lite items hash exactly like
++the source evidence. It does not load any checkpoint or start evaluation.
++
++The prepared environment must use Python 3.12+, `torch>=2.7`,
++`transformers>=5.15,<6`, `accelerate>=1.0,<2`, `bitsandbytes>=0.45`,
++`datasets>=3.0`, `huggingface_hub>=0.30`, `numpy>=1.26`, `pyyaml>=6`,
++`auditkit` commit `71316da`, `curatorkit` commit `dd9e835`, and SafeTune
++commit `3901a9f`. The existing `scripts/install_kits.sh --repair --cuda`
++workflow prepares these packages; the handoff runner never installs them.
++Record the actual versions printed by that installer in the remote run's
++`nf4-environment.json`; package metadata is part of the provenance.
++Preflight also recomputes the repository code hash and rejects a remote tree
++that differs from the offline plan.
++
++For reference, this Mac's source environment currently reports Python 3.12,
++torch 2.15.0, transformers 5.22.1, accelerate 1.15.0, datasets 5.1.0,
++hugging-hub 2.4.0, NumPy 2.5.4, PyYAML 6.0.3, AuditKIT 1.1.3, CuratorKIT
++0.1.21, SafeTune 0.1.12, and PEFT 0.21.2. These are provenance facts for the
++source tree; they are not a claim that this Darwin environment can run NF4.
++The CUDA host's recorded versions, not this list, are the versions used for
++the remote result. `scripts/install_kits.sh --repair --cuda` preserves the
++host's existing torch/transformers pins and installs the project's declared
++compatibility ranges; do not silently upgrade them between preflight and run.
++
++The local judge pair is also loaded with NF4 on the same CUDA device. Router
++judges are optional and require both `--judges router` and explicit
++`--allow-router` plus `HF_TOKEN`; router requests are never made by a dry run
++or local-jury execution.
++
++## Execute serially
++
++```bash
++LANGSAFE_PYTHON=.venv/bin/python bash scripts/run_nf4_evaluation.sh \
++  --source-run /mnt/lexsi/full-fire \
++  --spec /mnt/lexsi/full-fire/source-spec.yaml \
++  --output /mnt/lexsi/nf4-fire \
++  --family fire --judges local --execute
++```
++
++The runner copies the selected repair checkpoint into the isolated output,
++sets `LANGSAFE_DEVICE=cuda`, enables Hub/datasets offline mode, and calls the
++existing CLI one stage at a time. `current-stage.json`, per-stage logs,
++`nf4-environment.json`, and `nf4-status.json` are written atomically. A failed
++stage leaves `nf4_cuda: not_complete`; no failed or partial directory can be
++reported as an NF4 result. Final validation checks generation identities and
++rendered-prompt hashes against the source, explicit `quant: nf4` capability
++records for both preambles, two-judge coverage, AuditKIT artifacts, same-
++precision report comparisons, and artifact hashes.
++
++Useful post-run checks, all against the isolated output, are:
++
++```bash
++.venv/bin/python -m langsafe.cli --spec /mnt/lexsi/nf4-fire/source-spec.yaml \
++  --runs-dir /mnt/lexsi/nf4-fire ledger-verify
++.venv/bin/python -m langsafe.cli --spec /mnt/lexsi/nf4-fire/source-spec.yaml \
++  --runs-dir /mnt/lexsi/nf4-fire status --directory /mnt/lexsi/nf4-fire
++python - <<'PY'
++import json
++from pathlib import Path
++p = Path('/mnt/lexsi/nf4-fire')
++status = json.loads((p / 'nf4-status.json').read_text())
++assert status['software_run_complete'] and status['nf4_cuda'] == 'executed'
++assert json.loads((p / 'report.json').read_text())['validation_gaps'] == []
++print(status['report'])
++PY
++```
++
++The report retains refusal rates, benign over-refusal, capability accuracy,
++paired confidence intervals, McNemar tests, judge kappa, human calibration,
++and AuditKIT scorer artifacts. Run `scripts/render_results.py` on
++`report.json` only after the status and ledger checks pass; a report with
++missing calibration or an absent NF4 same-precision comparison remains
++provisional.
++
++`src/langsafe/gen/model.py` refuses NF4 on CPU/MPS, uses a strict CUDA device
++map (no CPU/disk offload), and rejects a loaded model that is not actually
++4-bit or has any non-CUDA placement. This prevents a silently mixed-precision
++run.
++
++The Mac cannot satisfy these preflight conditions: it is Darwin arm64 with no
++CUDA device and no installed `bitsandbytes`. That is an environment fact, not
++an NF4 execution result.
+diff --git a/src/langsafe/gen/model.py b/src/langsafe/gen/model.py
+index 3481ebe..c50a918 100644
+--- a/src/langsafe/gen/model.py
++++ b/src/langsafe/gen/model.py
+@@ -33,14 +33,51 @@ def best_device() -> str:
+     return "cpu"
+
+
++def validate_nf4_model(model) -> None:
++    """Reject a 4-bit load that silently fell back to CPU/disk or another quantizer."""
++    loaded_in_4bit = bool(getattr(model, "is_loaded_in_4bit", False))
++    quantizer = getattr(model, "hf_quantizer", None)
++    config = (getattr(quantizer, "quantization_config", None)
++              or getattr(model, "quantization_config", None))
++    if config is not None:
++        quant_type = str(getattr(config, "bnb_4bit_quant_type", "")).lower()
++        if quant_type and quant_type != "nf4":
++            raise RuntimeError(f"NF4 requested but loaded quantizer type is {quant_type!r}")
++        loaded_in_4bit = loaded_in_4bit or (
++            bool(getattr(config, "_load_in_4bit", getattr(config, "load_in_4bit", False)))
++            and quant_type == "nf4"
++        )
++    if not loaded_in_4bit:
++        raise RuntimeError("NF4 requested but Transformers did not load a 4-bit model")
++    device_map = getattr(model, "hf_device_map", None)
++    if not isinstance(device_map, dict) or not device_map:
++        raise RuntimeError("NF4 model has no verifiable CUDA device map")
++    offloaded = []
++    for name, device in device_map.items():
++        if isinstance(device, int):
++            on_cuda = device == 0
++        else:
++            on_cuda = str(device).lower() in {"cuda", "cuda:0"}
++        if not on_cuda:
++            offloaded.append(f"{name or '<root>'}={device}")
++    if offloaded:
++        raise RuntimeError("NF4 model has non-CUDA placement (CPU/disk offload is forbidden): " + ", ".join(offloaded))
++
++
+ def load(model_id: str, dtype: str = "float16", quant: str | None = None, adapter: str | None = None,
+          device_map: str | None = None):
+     import torch
+     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+     dev = best_device()
++    if quant == "nf4" and (dev != "cuda" or not torch.cuda.is_available()):
++        raise RuntimeError("NF4 (bitsandbytes) needs a CUDA GPU; refusing a CPU/MPS fallback")
++    if quant == "nf4" and device_map is not None and device_map != {"": 0}:
++        raise RuntimeError("NF4 requires the strict single-CUDA device map {'': 0}; CPU/disk offload is forbidden")
+     if device_map is None:
+-        device_map = "auto" if dev == "cuda" else {"": dev}
++        # Auto placement can silently spill 4-bit layers onto host memory.  A
++        # strict CUDA map makes insufficient VRAM fail at load time.
++        device_map = {"": 0} if quant == "nf4" else ("auto" if dev == "cuda" else {"": dev})
+     if dev == "cpu" and dtype == "float16":
+         dtype = "float32"          # fp16 matmuls are slow or unsupported on CPU
+     kwargs = {"device_map": device_map, "dtype": getattr(torch, dtype)}
+@@ -57,6 +94,8 @@ def load(model_id: str, dtype: str = "float16", quant: str | None = None, adapte
+     path = resolve_model(model_id)
+     tok = AutoTokenizer.from_pretrained(path)
+     model = AutoModelForCausalLM.from_pretrained(path, **kwargs)
++    if quant == "nf4":
++        validate_nf4_model(model)
+     if adapter:
+         from peft import PeftModel
+
+
+# Parent-owned integration note (intentionally no hunk is included here):
+# src/langsafe/llm_client.py should resolve its default CACHE_PATH from
+# LANGSAFE_RUNS_DIR so local judge cache artifacts stay inside the isolated
+# NF4 run. That change belongs to the parent agent's patch.
